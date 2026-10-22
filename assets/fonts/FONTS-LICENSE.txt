@@ -1,0 +1,8 @@
+Fonts bundled for embedding:
+
+- Isometra-Regular.ttf — Google Fonts, SIL Open Font License 1.1
+- Inter-Regular.ttf — Google Fonts, SIL Open Font License 1.1
+- Inter-SemiBold.ttf — Google Fonts, SIL Open Font License 1.1 (derived: heavier instance)
+
+OFL: fonts may be embedded and redistributed in applications and plugins,
+including commercial ones. Number of glyphs may not be restricted.
