@@ -1,5 +1,6 @@
 #include "KeyDetector.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 
@@ -43,13 +44,13 @@ double correlation (const double* a, const double* b)
 }
 } // namespace
 
-const char* pitchClassName (int pc) { return kPitchNames[((pc % 12) + 12) % 12]; }
+const char* pitchClassName (int pc) { return kPitchNames[wrapPc (pc)]; }
 
-const char* KeyResult::keyName() const
+juce::String keyTitle (const KeyResult& r)
 {
-    if (! valid || tonicPc < 0 || (mode != 0 && mode != 1))
+    if (! r.valid || r.tonicPc < 0)
         return "?";
-    return mode == 0 ? "major" : "minor";
+    return juce::String (pitchClassName (r.tonicPc)) + " " + r.modeText();
 }
 
 void KeyDetector::prepare (double newSampleRate)
@@ -60,26 +61,22 @@ void KeyDetector::prepare (double newSampleRate)
     for (int i = 0; i < kFftSize; ++i)
         window[(size_t) i] = (float) (0.5 - 0.5 * std::cos (juce::MathConstants<double>::twoPi * (double) i / (double) (kFftSize - 1)));
 
-    // input FIFO big enough for any host block plus one frame
-    pending.assign ((size_t) kFftSize + (1 << 17), 0.0f);
+    pending.assign ((size_t) kFftSize + (size_t) kMaxBlockSamples, 0.0f);
     pendingSize = 0;
     frameData.assign ((size_t) kFftSize * 2, 0.0f);
 
     const int windowFrames = (int) std::ceil ((15.0 * sampleRate) / (double) kHopSize) + 4;
-    frameRing.assign ((size_t) windowFrames, {});
-    chromaSum.fill (0.0);
-    ringHead = 0;
-    activeFrames = 0;
-    totalActiveFrames = 0;
+    ringCapacity = windowFrames;
+    frameRing.reset (new ChromaSlot[(size_t) windowFrames]); // default-constructed, no copies
+    ringWrite = 0;
 }
 
 void KeyDetector::reset()
 {
     pendingSize = 0;
-    ringHead = 0;
-    activeFrames = 0;
-    totalActiveFrames = 0;
-    chromaSum.fill (0.0);
+    ringWrite = 0;
+    for (int i = 0; i < ringCapacity; ++i)
+        frameRing[(size_t) i].seq.store (0, std::memory_order_release);
 }
 
 void KeyDetector::addMono (const float* samples, int numSamples)
@@ -88,7 +85,7 @@ void KeyDetector::addMono (const float* samples, int numSamples)
         return;
 
     const int capacity = (int) pending.size();
-    const int copy = juce::jmin (numSamples, capacity - pendingSize); // drop overflow; window is plenty larger than any sane block
+    const int copy = juce::jmin (numSamples, capacity - pendingSize);
     if (copy <= 0)
         return;
 
@@ -119,21 +116,12 @@ void KeyDetector::processPendingFrames()
 
             auto frame = chromaFromFrame (frameData.data(), kFftSize, sampleRate);
 
-            const int capacity = (int) frameRing.size();
-            if (activeFrames == capacity) // window full: drop oldest
-            {
-                for (int pc = 0; pc < kNumPitchClasses; ++pc)
-                    chromaSum[(size_t) pc] -= (double) frameRing[(size_t) ringHead][(size_t) pc];
-                ringHead = (ringHead + 1) % capacity;
-                --activeFrames;
-            }
-
-            const int slot = (ringHead + activeFrames) % capacity;
-            frameRing[(size_t) slot] = frame;
-            for (int pc = 0; pc < kNumPitchClasses; ++pc)
-                chromaSum[(size_t) pc] += frame[(size_t) pc];
-            ++activeFrames;
-            ++totalActiveFrames;
+            // seqlock publish: book a slot, mark in-progress, fill, mark stable
+            auto& slot = frameRing[(size_t) ringWrite];
+            ringWrite = (ringWrite + 1) % ringCapacity; // next frame overwrites oldest
+            slot.seq.fetch_add (1, std::memory_order_release);    // odd: mid-write
+            slot.chroma = frame;
+            slot.seq.fetch_add (1, std::memory_order_release);    // even: stable
         }
 
         // shift the next hop of samples to the front
@@ -164,8 +152,7 @@ KeyDetector::chromaFromFrame (const float* fftData, int fftSize, double sr)
         const double midi = 69.0 + 12.0 * std::log2 (freq / 440.0);
         const double octaveWeight = (midi < 48.0 || midi > 84.0) ? 0.5 : 1.0;
 
-        const int pc = (((int) std::lround (midi)) % 12 + 12) % 12;
-        chroma[(size_t) pc] += (float) (mag * octaveWeight);
+        chroma[(size_t) wrapPc ((int) std::lround (midi))] += (float) (mag * octaveWeight);
         sum += mag;
     }
     if (sum > 0.0)
@@ -174,18 +161,50 @@ KeyDetector::chromaFromFrame (const float* fftData, int fftSize, double sr)
     return chroma;
 }
 
+// seqlock read pattern — false when the frame is unpublished or mid-write
+bool KeyDetector::tryReadFrame (const ChromaSlot& slot, std::array<float, kNumPitchClasses>& out) const
+{
+    const uint32_t s1 = slot.seq.load (std::memory_order_acquire);
+    if (s1 == 0 || (s1 & 1u) != 0)
+        return false;
+    out = slot.chroma;
+    std::atomic_thread_fence (std::memory_order_acquire);
+    return slot.seq.load (std::memory_order_relaxed) == s1;
+}
+
+int KeyDetector::stableFrameCount() const
+{
+    std::array<float, kNumPitchClasses> tmp;
+    int count = 0;
+    for (int i = 0; i < ringCapacity; ++i)
+        if (tryReadFrame (frameRing[(size_t) i], tmp))
+            ++count;
+    return count;
+}
+
 KeyResult KeyDetector::detect() const
 {
     KeyResult out;
-    if (activeFrames < kMinActiveFrames)
+
+    std::array<double, kNumPitchClasses> avg {};
+    int count = 0;
+    std::array<float, kNumPitchClasses> tmp;
+    for (int i = 0; i < ringCapacity; ++i)
+        if (tryReadFrame (frameRing[(size_t) i], tmp))
+            for (int pc = 0; pc < kNumPitchClasses; ++pc)
+            {
+                avg[(size_t) pc] += tmp[(size_t) pc];
+                ++count;
+            }
+
+    if (count < kMinActiveFrames)
         return out;
 
-    double avg[kNumPitchClasses] = {};
     double energy = 0.0;
     for (int pc = 0; pc < kNumPitchClasses; ++pc)
     {
-        avg[pc] = chromaSum[(size_t) pc] / (double) activeFrames;
-        energy += avg[pc];
+        avg[(size_t) pc] /= (double) count;
+        energy += avg[(size_t) pc];
     }
     if (energy < 0.05) // window was (almost) silence or pure noise
         return out;
@@ -201,7 +220,7 @@ KeyResult KeyDetector::detect() const
             for (int i = 0; i < kNumPitchClasses; ++i)
                 profile[(i + rotate) % 12] = (mode == 0 ? kMajorProfile : kMinorProfile)[i];
 
-            const double r = correlation (avg, profile);
+            const double r = correlation (avg.data(), profile);
             if (r > bestR)
             {
                 secondR = bestR;
@@ -225,7 +244,7 @@ KeyResult KeyDetector::detect() const
 
 bool KeyDetector::hasEnoughAudio() const
 {
-    return activeFrames >= kMinActiveFrames;
+    return stableFrameCount() >= kMinActiveFrames;
 }
 
 } // namespace keysync

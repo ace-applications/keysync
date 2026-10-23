@@ -30,8 +30,6 @@ private:
     juce::Typeface::Ptr interSemi;
     juce::Font titleFont;      // Isometra
     juce::Font keyFont;        // Isometra big
-    juce::Font labelFont;      // Inter
-    juce::Font smallFont;      // Inter small
 
     // child components (custom painted)
     struct TitleBar : juce::Component
@@ -64,6 +62,19 @@ private:
     AnalyzeButton analyzeButton { *this };
     ProPanel proPanel { *this };
     juce::HyperlinkButton getPro { "Get ACE Audio KeySync Pro", juce::URL ("https://aceaudio.example") };
+
+    struct AnalyzePulse : juce::Timer // one-shot delayed continuation of Analyze
+    {
+        KeySyncAudioProcessorEditor& owner;
+        explicit AnalyzePulse (KeySyncAudioProcessorEditor& o) : owner (o) {}
+        void timerCallback() override
+        {
+            stopTimer();
+            owner.processor.performAnalysis();
+            owner.repaint();
+        }
+    };
+    AnalyzePulse analyzePulse { *this };
 
     JUCE_DECLARE_NON_COPYABLE (KeySyncAudioProcessorEditor)
 };

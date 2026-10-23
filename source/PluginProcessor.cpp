@@ -41,13 +41,16 @@ void KeySyncAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     detector.addMono (mono, numSamples);
 }
 
-void KeySyncAudioProcessor::runAnalysis()
+void KeySyncAudioProcessor::requestAnalysis()
 {
     if (state.load (std::memory_order_relaxed) == AnalyzeState::analyzing)
         return;
 
     state.store (AnalyzeState::analyzing, std::memory_order_relaxed);
+}
 
+void KeySyncAudioProcessor::performAnalysis()
+{
     if (! detector.hasEnoughAudio())
     {
         state.store (AnalyzeState::noUsableAudio, std::memory_order_relaxed);

@@ -23,6 +23,11 @@ inline juce::Font fontOf (const juce::Typeface::Ptr& tf, float height)
     return juce::Font (juce::FontOptions().withTypeface (tf).withHeight (height));
 }
 
+juce::String confidencePercent (const KeyResult& r)
+{
+    return juce::String (int (r.confidence * 100.0f)) + "%";
+}
+
 // simulated glass panel (brief wants glassmorphism; a VST3 cannot blur what is
 // behind it, so this is layered translucency + a hairline border)
 void drawGlass (juce::Graphics& g, juce::Rectangle<float> r)
@@ -58,8 +63,6 @@ KeySyncAudioProcessorEditor::KeySyncAudioProcessorEditor (KeySyncAudioProcessor&
 
     titleFont = makeFont (isometra, 26.0f);
     keyFont = makeFont (isometra, 58.0f);
-    labelFont = makeFont (inter, 14.0f);
-    smallFont = makeFont (inter, 12.0f);
 
     addAndMakeVisible (title);
     addAndMakeVisible (keyDisplay);
@@ -75,8 +78,15 @@ KeySyncAudioProcessorEditor::KeySyncAudioProcessorEditor (KeySyncAudioProcessor&
 
     analyzeButton.onClick = [this]
     {
-        processor.runAnalysis();
+        if (processor.getState() == AnalyzeState::analyzing)
+            return;
+
+        processor.requestAnalysis();
         repaint();
+
+        // keep the Analyzing state visible for one paint before the compute;
+        // Timer is lifetime-safe (auto-stopped if the editor dies first)
+        analyzePulse.startTimer (60);
     };
 
     // shortcut: "Get Pro" URL is a placeholder until ACE Audio ships a real store page
@@ -87,7 +97,7 @@ void KeySyncAudioProcessorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (uiColour (kBg));
 
-    // brand glow, kept inside palette spirit: orange top-right, violet bottom-left
+    // brand glow, palette-only: warm orange top-right, quiet grey bottom-left
     {
         juce::ColourGradient orange (juce::Colour (0x2EFF8A24u), 340.0f, 40.0f,
                                      juce::Colour (0x00FF8A24u), 340.0f, 40.0f + 300.0f, true);
@@ -95,9 +105,9 @@ void KeySyncAudioProcessorEditor::paint (juce::Graphics& g)
         g.fillAll();
     }
     {
-        juce::ColourGradient violet (juce::Colour (0x2A6f65ffu), 40.0f, 590.0f,
-                                     juce::Colour (0x006f65ffu), 40.0f + 300.0f, 590.0f - 280.0f, true);
-        g.setGradientFill (violet);
+        juce::ColourGradient grey (juce::Colour (0x16A3A3A3u), 40.0f, 590.0f,
+                                   juce::Colour (0x00A3A3A3u), 40.0f + 300.0f, 590.0f - 280.0f, true);
+        g.setGradientFill (grey);
         g.fillAll();
     }
 }
@@ -179,11 +189,11 @@ void KeySyncAudioProcessorEditor::KeyDisplay::paint (juce::Graphics& g)
             auto bb = b;
             g.setFont (owner.keyFont);
             g.setColour (uiColour (kWhite));
-            g.drawText (juce::String (pitchClassName (r.tonicPc)) + " " + r.keyName(), bb, text);
+            g.drawText (keyTitle (r), bb, text);
 
             g.setFont (fontOf (owner.inter, 12.0f));
             g.setColour (uiColour (kGrey));
-            g.drawText (juce::String ("Confidence ") + juce::String (int (r.confidence * 100.0f)) + "%",
+            g.drawText ("Confidence " + confidencePercent (r),
                         bb.removeFromBottom (44.0f), text);
             break;
         }
@@ -197,9 +207,8 @@ void KeySyncAudioProcessorEditor::KeyDisplay::paint (juce::Graphics& g)
 
             g.setFont (fontOf (owner.inter, 12.0f));
             g.setColour (uiColour (kOrange));
-            g.drawText (juce::String ("Low confidence - best guess: ")
-                            + pitchClassName (r.tonicPc) + " " + r.keyName()
-                            + " (" + juce::String (int (r.confidence * 100.0f)) + "%)",
+            g.drawText ("Low confidence - best guess: " + keyTitle (r)
+                            + " (" + confidencePercent (r) + ")",
                         bb.removeFromBottom (44.0f), text);
             break;
         }
@@ -272,7 +281,7 @@ void KeySyncAudioProcessorEditor::ProPanel::paint (juce::Graphics& g)
             g.setFont (fontOf (owner.isometra, 20.0f));
             g.setColour (uiColour (kWhite));
             g.drawText (juce::String (pitchClassName (suggestions[i].tonicPc)) + " "
-                            + (suggestions[i].mode == 0 ? "major" : "minor"),
+                            + modeName (suggestions[i].mode),
                         row, juce::Justification::centredLeft);
 
             // relationship chip, right aligned

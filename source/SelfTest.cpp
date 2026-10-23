@@ -6,16 +6,12 @@
 
 #include <cmath>
 #include <cstdio>
+#include <string>
 
 using namespace keysync;
 
 namespace
 {
-struct TestingDetector : KeyDetector
-{
-    // nothing extra; exposed via public API only
-};
-
 std::vector<float> renderNote (double sampleRate, double freq, double seconds, float amp = 0.3f)
 {
     std::vector<float> out ((size_t) (seconds * sampleRate));
@@ -67,7 +63,7 @@ int failures = 0;
 
 KeyResult detectRendered (double sampleRate, const std::vector<float>& audio)
 {
-    TestingDetector d;
+    KeyDetector d;
     d.prepare (sampleRate);
     for (size_t start = 0; start < audio.size(); start += 512)
         d.addMono (audio.data() + start,
@@ -85,7 +81,7 @@ int main()
     const KeyResult cm = detectRendered (sr, cMajor);
     CHECK (cm.valid, "C major renders valid detection");
     CHECK (cm.tonicPc == 0 && cm.mode == 0,
-           ("expected C major, got " + juce::String (pitchClassName (cm.tonicPc)) + " " + cm.keyName()).toStdString());
+           ("expected C major, got " + keyTitle (cm)).toStdString());
     CHECK (cm.confidence > 0.2f, "C major confidence > 0.2");
 
     std::vector<float> aMinor;
@@ -93,17 +89,17 @@ int main()
     const KeyResult am = detectRendered (sr, aMinor);
     CHECK (am.valid, "A minor renders valid detection");
     CHECK (am.tonicPc == 9 && am.mode == 1,
-           ("expected A minor, got " + juce::String (pitchClassName (am.tonicPc)) + " " + am.keyName()).toStdString());
+           ("expected A minor, got " + keyTitle (am)).toStdString());
 
     // silence / insufficient audio
-    TestingDetector empty;
-    empty.prepare (sr);
-    const KeyResult silent = empty.detect();
+    KeyDetector emptyDetector;
+    emptyDetector.prepare (sr);
+    const KeyResult silent = emptyDetector.detect();
     CHECK (! silent.valid, "silence yields invalid result (no usable audio)");
 
     std::vector<float> shortAudio (cMajor.begin(), cMajor.begin() + 512); // ~12 ms
-    empty.addMono (shortAudio.data(), (int) shortAudio.size());
-    CHECK (! empty.detect().valid, "12 ms of audio yields invalid result");
+    emptyDetector.addMono (shortAudio.data(), (int) shortAudio.size());
+    CHECK (! emptyDetector.detect().valid, "12 ms of audio yields invalid result");
 
     // recommender: C major -> relative minor first; A minor -> relative major first
     {
@@ -111,8 +107,8 @@ int main()
         const auto rec = recommendCompatibleKeys (c);
         CHECK (rec.size() >= 3, "C major produces suggestions");
         CHECK (rec[0].tonicPc == 9 && rec[0].mode == 1
-               && std::string (rec[0].relationship) == "Relative minor",
-               "C major first suggestion is A minor (Relative minor)");
+               && std::string (rec[0].relationship) == "Relative",
+               "C major first suggestion is A minor (Relative)");
         CHECK (std::string (rec[1].relationship) == "Dominant"
                && rec[1].tonicPc == 7 && rec[1].mode == 0,
                "C major second suggestion is G major (Dominant)");

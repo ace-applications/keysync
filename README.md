@@ -37,12 +37,41 @@ quality with the margin between the top two keys. Thresholds live in
 Run the detector self-test (no host needed):
 
 ```
-cmake --build build --target keysync_selftest -- --config? (plain target build)
-build/keysync_selftest
+cmake --build build --target keysync_selftest --config Release
+build\Release\keysync_selftest.exe
 ```
+
+## Known limitations
+
+- Tonality window is 55 Hz – 4 kHz; content entirely outside that range is
+  invisible to the detector.
+- Results are deliberately unreliable on drums-only, atonal, noisy or heavily
+  distorted material; the confidence readout flags them rather than guessing.
+- Bach-style polyphonic ambiguity and modal material (Dorian etc.) can sit
+  between major/minor; confidence drops and "Uncertain" shows.
+- Confidence percentages are not yet calibrated on a measured test set (that
+  is the fixture plan in `docs/TESTING.md`, pending).
+- Analysis window is a rolling last-15-seconds snapshot; if you stop playback
+  and press Analyze much later, the key shown may be from stale audio.
+- "Get Pro" link is a placeholder URL until the store page exists.
+- Free/Pro are separate binaries; the `KEYSYNC_EDITION_PRO` flag is the seam
+  for the future account-login unlock (ACE Studios API, still in development).
 
 Planned: accuracy fixture against ~50 known-key clips, targets and results in
 `docs/TESTING.md` (to be written after the accuracy run).
+
+## Releases
+
+CI builds both editions on every `v*` tag: GitHub Actions (`.github/workflows/
+release.yml`) compiles on `windows-latest`, runs the detector self-test, and
+uploads `KeySyncFree_VST3-win-x64.zip` / `KeySyncPro_VST3-win-x64.zip` to the
+tag's GitHub Release. To cut a release:
+
+```
+git tag v1.0.0 && git push origin main --tags
+```
+
+Note: the binaries are unsigned; Windows SmartScreen/AV may warn on first use.
 
 ## Editions
 

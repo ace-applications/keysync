@@ -45,11 +45,15 @@ public:
     void getStateInformation (juce::MemoryBlock&) override {}
     void setStateInformation (const void*, int) override {}
 
-    // Message thread only.
+    // Message thread only. requestAnalysis shows the Analyzing state; the
+    // editor then calls performAnalysis on a short delay so the state is
+    // actually painted (analysis itself is ~tens of ms on the message thread —
+    // the audio thread is never blocked).
     AnalyzeState getState() const { return state.load (std::memory_order_relaxed); }
     KeyResult getLastResult() const { return lastResult; }
 
-    void runAnalysis(); // runs on the calling (message) thread
+    void requestAnalysis();
+    void performAnalysis();
 
 private:
     KeyDetector detector;
