@@ -10,7 +10,9 @@ permissions:
 
 jobs:
   windows-vst3:
-    runs-on: windows-latest
+    # pinned: windows-latest moved to VS 2026; repo builds with the VS 2022
+    # v143 toolset until the project decides to migrate toolsets
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
