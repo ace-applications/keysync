@@ -19,17 +19,17 @@ public:
 private:
     KeySyncAudioProcessor& processor;
 
-    // brand
-    static constexpr uint32_t kBg = 0xff080808u;
+    // brand (bg = ACE Audio dark navy per product brief)
+    static constexpr uint32_t kBg = 0xff080C19u;
     static constexpr uint32_t kOrange = 0xffFF8A24u;
     static constexpr uint32_t kGrey = 0xffA3A3A3u;
     static constexpr uint32_t kWhite = 0xffffffffu;
 
-    juce::Typeface::Ptr isometra;
+    juce::Typeface::Ptr isometra;   // wordmark/logo heading only — glyphs broken for body text
     juce::Typeface::Ptr inter;
     juce::Typeface::Ptr interSemi;
-    juce::Font titleFont;      // Isometra
-    juce::Font keyFont;        // Isometra big
+    juce::Font titleFont;      // Isometra (logo wordmark)
+    juce::Font keyFont;        // Inter SemiBold big
 
     // child components (custom painted)
     struct TitleBar : juce::Component
@@ -44,23 +44,31 @@ private:
         explicit KeyDisplay (KeySyncAudioProcessorEditor& o) : owner (o) {}
         void paint (juce::Graphics&) override;
     };
-    struct AnalyzeButton : juce::Button
+struct AnalyzeButton : juce::Button
     {
         KeySyncAudioProcessorEditor& owner;
         AnalyzeButton (KeySyncAudioProcessorEditor& o) : juce::Button ("Analyze"), owner (o) {}
         void paintButton (juce::Graphics&, bool over, bool down) override;
+        bool hitTest (int x, int y) override;
+        void mouseEnter (const juce::MouseEvent&) override { repaint(); };
+        void mouseExit (const juce::MouseEvent&) override { repaint(); };
     };
-    struct ProPanel : juce::Component
+    struct ProPanel : juce::Component, juce::SettableTooltipClient
     {
         KeySyncAudioProcessorEditor& owner;
         explicit ProPanel (KeySyncAudioProcessorEditor& o) : owner (o) {}
         void paint (juce::Graphics&) override;
+        void mouseMove (const juce::MouseEvent&) override { hoverRow(); }
+        void mouseExit (const juce::MouseEvent&) override { setTooltip (""); }
+    private:
+        void hoverRow();
     };
 
     TitleBar title { *this };
     KeyDisplay keyDisplay { *this };
     AnalyzeButton analyzeButton { *this };
     ProPanel proPanel { *this };
+    juce::TooltipWindow tooltip; // explains chip vocabulary on hover
     juce::HyperlinkButton getPro { "Get ACE Audio KeySync Pro", juce::URL ("https://aceaudio.example") };
 
     struct AnalyzePulse : juce::Timer // one-shot delayed continuation of Analyze
@@ -75,6 +83,24 @@ private:
         }
     };
     AnalyzePulse analyzePulse { *this };
+
+    // repaints only when the staleness flag flips (came from the audio thread)
+    struct StalePoll : juce::Timer
+    {
+        KeySyncAudioProcessorEditor& owner;
+        explicit StalePoll (KeySyncAudioProcessorEditor& o) : owner (o) { startTimer (400); }
+        void timerCallback() override
+        {
+            const bool s = owner.processor.isStale();
+            if (s != lastStale)
+            {
+                lastStale = s;
+                owner.repaint();
+            }
+        }
+        bool lastStale = false;
+    };
+    StalePoll stalePoll { *this };
 
     JUCE_DECLARE_NON_COPYABLE (KeySyncAudioProcessorEditor)
 };

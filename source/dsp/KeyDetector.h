@@ -12,6 +12,7 @@ namespace keysync
 {
 
 constexpr int kNumPitchClasses = 12;
+constexpr int kTempoBands = 32; // log-spaced magnitude bands 35 Hz-8 kHz
 
 inline int wrapPc (int pc) { return ((pc % 12) + 12) % 12; }
 inline const char* modeName (int mode) { return mode == 0 ? "major" : "minor"; }
@@ -21,10 +22,14 @@ const char* pitchClassName (int pc);
 // tonicPc: 0=C ... 11=B. mode: 0 = major, 1 = minor.
 struct KeyResult
 {
-    bool valid = false;         // a detection was actually computed
+    bool valid = false;         // a key detection was actually computed
     int tonicPc = -1;
     int mode = -1;
     float confidence = 0.0f;    // 0..1
+
+    // bpmConfidence < 0.5 -> no honest tempo claim, UI shows "BPM uncertain"
+    float bpm = 0.0f;           // 0 = none           // 0 = none
+    float bpmConfidence = 0.0f; // 0..1
 
     const char* modeText() const { return modeName (mode); }
 };
@@ -48,6 +53,10 @@ public:
     // host block; anything larger is truncated on purpose to bound the buffer.
     static constexpr int kMaxBlockSamples = 1 << 17;
 
+    // rolling analysis window: longer than the original 15 s so slow / soft
+    // pulse material still yields an honest tempo claim (30 s, user-approved)
+    static constexpr double kAnalysisWindowSeconds = 30.0;
+
     void prepare (double sampleRate);
     void reset();
 
@@ -65,15 +74,18 @@ private:
     {
         std::atomic<uint32_t> seq { 0 };
         std::array<float, kNumPitchClasses> chroma {};
+        std::array<float, kTempoBands> bands {};
     };
 
     int stableFrameCount() const;
-    bool tryReadFrame (const ChromaSlot& slot, std::array<float, kNumPitchClasses>& out) const;
+    bool tryReadFrame (const ChromaSlot& slot, ChromaSlot& out) const;
 
     void processPendingFrames();
-    static std::array<float, kNumPitchClasses> chromaFromFrame (const float* fftData,
-                                                               int fftSize,
-                                                               double sampleRate);
+    static void chromaFromFrame (const float* fftData, int fftSize, double sampleRate,
+                                 std::array<float, kNumPitchClasses>& chroma,
+                                 std::array<float, kTempoBands>& bands);
+    void estimateTempo (const std::vector<std::array<float, kTempoBands>>& bandFrames,
+                        KeyResult& out) const;
 
     static constexpr int kHopSize = kFftSize / 2;
 

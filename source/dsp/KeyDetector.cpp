@@ -65,7 +65,7 @@ void KeyDetector::prepare (double newSampleRate)
     pendingSize = 0;
     frameData.assign ((size_t) kFftSize * 2, 0.0f);
 
-    const int windowFrames = (int) std::ceil ((15.0 * sampleRate) / (double) kHopSize) + 4;
+    const int windowFrames = (int) std::ceil ((kAnalysisWindowSeconds * sampleRate) / (double) kHopSize) + 4;
     ringCapacity = windowFrames;
     frameRing.reset (new ChromaSlot[(size_t) windowFrames]); // default-constructed, no copies
     ringWrite = 0;
@@ -105,6 +105,10 @@ void KeyDetector::processPendingFrames()
             sqrSum += (double) pending[(size_t) i] * (double) pending[(size_t) i];
         const double rms = std::sqrt (sqrSum / (double) kFftSize);
 
+        // every hop enters the ring on a uniform time grid (the tempo stage needs
+        // adjacent-evenly-spaced frames); silent frames publish an empty payload
+        std::array<float, kNumPitchClasses> chroma {};
+        std::array<float, kTempoBands> bands {};
         if (rms >= kRmsThreshold)
         {
             for (int i = 0; i < kFftSize; ++i)
@@ -114,15 +118,16 @@ void KeyDetector::processPendingFrames()
 
             fft.performRealOnlyForwardTransform (frameData.data(), true);
 
-            auto frame = chromaFromFrame (frameData.data(), kFftSize, sampleRate);
-
-            // seqlock publish: book a slot, mark in-progress, fill, mark stable
-            auto& slot = frameRing[(size_t) ringWrite];
-            ringWrite = (ringWrite + 1) % ringCapacity; // next frame overwrites oldest
-            slot.seq.fetch_add (1, std::memory_order_release);    // odd: mid-write
-            slot.chroma = frame;
-            slot.seq.fetch_add (1, std::memory_order_release);    // even: stable
+            chromaFromFrame (frameData.data(), kFftSize, sampleRate, chroma, bands);
         }
+
+        // seqlock publish: book a slot, mark in-progress, fill, mark stable
+        auto& slot = frameRing[(size_t) ringWrite];
+        ringWrite = (ringWrite + 1) % ringCapacity; // next frame overwrites oldest
+        slot.seq.fetch_add (1, std::memory_order_release);    // odd: mid-write
+        slot.chroma = chroma;
+        slot.bands = bands;
+        slot.seq.fetch_add (1, std::memory_order_release);    // even: stable
 
         // shift the next hop of samples to the front
         const int remaining = pendingSize - kHopSize;
@@ -131,10 +136,12 @@ void KeyDetector::processPendingFrames()
     }
 }
 
-std::array<float, kNumPitchClasses>
-KeyDetector::chromaFromFrame (const float* fftData, int fftSize, double sr)
+void KeyDetector::chromaFromFrame (const float* fftData, int fftSize, double sr,
+                                   std::array<float, kNumPitchClasses>& chroma,
+                                   std::array<float, kTempoBands>& bands)
 {
-    std::array<float, kNumPitchClasses> chroma {};
+    chroma = {};
+    bands = {};
     double sum = 0.0;
     for (int bin = 0; bin < fftSize / 2; ++bin)
     {
@@ -145,6 +152,15 @@ KeyDetector::chromaFromFrame (const float* fftData, int fftSize, double sr)
             continue;
 
         const double freq = (double) bin * sr / (double) fftSize;
+
+        // tempo bands: 32 log-spaced bins, 35 Hz - 8 kHz (magitudes kept loud)
+        if (freq >= 35.0 && freq <= 8000.0)
+        {
+            const int band = juce::jlimit (0, kTempoBands - 1,
+                (int) (kTempoBands * (std::log (freq / 35.0) / std::log (8000.0 / 35.0))));
+            bands[(size_t) band] += (float) mag;
+        }
+
         if (freq < 55.0 || freq > 4000.0) // tonal range for pop music, skip rumble/hiss
             continue;
 
@@ -158,26 +174,34 @@ KeyDetector::chromaFromFrame (const float* fftData, int fftSize, double sr)
     if (sum > 0.0)
         for (float& c : chroma)
             c /= (float) sum; // per-frame normalisation, loudness independent
-    return chroma;
 }
-
 // seqlock read pattern — false when the frame is unpublished or mid-write
-bool KeyDetector::tryReadFrame (const ChromaSlot& slot, std::array<float, kNumPitchClasses>& out) const
+bool KeyDetector::tryReadFrame (const ChromaSlot& slot, ChromaSlot& out) const
 {
     const uint32_t s1 = slot.seq.load (std::memory_order_acquire);
     if (s1 == 0 || (s1 & 1u) != 0)
         return false;
-    out = slot.chroma;
+    out.chroma = slot.chroma;
+    out.bands = slot.bands;
     std::atomic_thread_fence (std::memory_order_acquire);
     return slot.seq.load (std::memory_order_relaxed) == s1;
 }
 
+// normalized chroma sums to ~1 for any frame with tonal content, 0 when silent
+static bool frameHasContent (const std::array<float, kNumPitchClasses>& chroma)
+{
+    float sum = 0.0f;
+    for (float c : chroma)
+        sum += c;
+    return sum > 0.25f;
+}
+
 int KeyDetector::stableFrameCount() const
 {
-    std::array<float, kNumPitchClasses> tmp;
+    ChromaSlot tmp;
     int count = 0;
     for (int i = 0; i < ringCapacity; ++i)
-        if (tryReadFrame (frameRing[(size_t) i], tmp))
+        if (tryReadFrame (frameRing[(size_t) i], tmp) && frameHasContent (tmp.chroma))
             ++count;
     return count;
 }
@@ -188,14 +212,23 @@ KeyResult KeyDetector::detect() const
 
     std::array<double, kNumPitchClasses> avg {};
     int count = 0;
-    std::array<float, kNumPitchClasses> tmp;
+    ChromaSlot tmp;
+    std::vector<std::array<float, kNumPitchClasses>> chromaFrames;
+    std::vector<std::array<float, kTempoBands>> bandFrames;
+    chromaFrames.reserve ((size_t) ringCapacity);
+    bandFrames.reserve ((size_t) ringCapacity);
     for (int i = 0; i < ringCapacity; ++i)
         if (tryReadFrame (frameRing[(size_t) i], tmp))
-            for (int pc = 0; pc < kNumPitchClasses; ++pc)
+        {
+            if (frameHasContent (tmp.chroma))
             {
-                avg[(size_t) pc] += tmp[(size_t) pc];
+                for (int pc = 0; pc < kNumPitchClasses; ++pc)
+                    avg[(size_t) pc] += tmp.chroma[(size_t) pc];
                 ++count;
             }
+            chromaFrames.push_back (tmp.chroma); // full time grid for the tempo stage
+            bandFrames.push_back (tmp.bands);
+        }
 
     if (count < kMinActiveFrames)
         return out;
@@ -239,7 +272,229 @@ KeyResult KeyDetector::detect() const
     const double margin = std::max (0.0, bestR - secondR);
     const double certainty = std::min (1.0, margin / 0.10);
     out.confidence = (float) juce::jlimit (0.0, 1.0, bestR * (0.55 + 0.45 * certainty));
+
+    // tempo stage — independent of the key fields above; stays 0/0 when unsure
+    estimateTempo (bandFrames, out);
     return out;
+}
+
+// Tempo from the published band magnitudes (librosa/Percival concepts, own code —
+// see docs/research/bpm-detection.md §5 approach #1):
+// half-rectified log-band flux ODF -> x4 upsample -> clamped + 120 BPM
+// lognormal-prior weighted ACF -> parabolic refine -> octave check.
+// Fills out.bpm / out.bpmConfidence; leaves 0/0 for silence, noise, pads.
+void KeyDetector::estimateTempo (const std::vector<std::array<float, kTempoBands>>& bandFrames,
+                                 KeyResult& out) const
+{
+    const int n = (int) bandFrames.size();
+#ifdef KEY_SYNC_DEBUG_TEMPO
+    std::fprintf (stderr, "[DBG-tempo] n=%d\n", n);
+#endif
+    if (n < kMinActiveFrames)
+        return;
+
+    const double fps = sampleRate / (double) kHopSize;
+    const double fpsUp = fps * 4.0; // research §4: native frame rate is too coarse
+
+    // ODF: log-band flux whitened by each band's window AVERAGE (transients get
+    // relative weight, sustained content ≈ 1). Bands with negligible window-mean
+    // presence (dead noise floor) are gated out — their whitened log flicker
+    // otherwise drowns the ODF ("+log floor noise"). The demean before the ACF
+    // keeps the always-positive flux baseline from dominating peak/mean.
+    std::array<double, kTempoBands> bandMean {};
+    for (int t = 0; t < n; ++t)
+        for (int b = 0; b < kTempoBands; ++b)
+            bandMean[(size_t) b] += (double) bandFrames[(size_t) t][(size_t) b];
+    for (int b = 0; b < kTempoBands; ++b)
+        bandMean[(size_t) b] = std::max (bandMean[(size_t) b] / (double) n, 1e-12);
+    double bandMaxMean = 0.0;
+    for (int b = 0; b < kTempoBands; ++b)
+        bandMaxMean = std::max (bandMaxMean, bandMean[(size_t) b]);
+
+    int liveBands = 0;
+    std::vector<double> odf ((size_t) (n - 1), 0.0);
+    for (int t = 1; t < n; ++t)
+    {
+        double s = 0.0;
+        for (int b = 0; b < kTempoBands; ++b)
+        {
+            if (bandMean[(size_t) b] < bandMaxMean * 0.05)
+                continue;
+            if (t == 1)
+                ++liveBands;
+            const double cur = std::log (std::max (bandFrames[(size_t) t][(size_t) b] / bandMean[(size_t) b], 1e-3));
+            const double prev = std::log (std::max (bandFrames[(size_t) (t - 1)][(size_t) b] / bandMean[(size_t) b], 1e-3));
+            const double d = cur - prev;
+            // attacks are magnitude rises of 10%+ per hop (~46 ms); below that
+            // level it is FFT reanalysis jitter of a sustained tone, not rhythm
+            if (d > 0.095)
+                s += d - 0.095;
+        }
+        odf[(size_t) (t - 1)] = s;
+    }
+    if (odf.size() < 2)
+        return;
+
+    // pure-tone content (sustained single note/pad): too little spectral
+    // diversity for a pulse claim — the log flicker above is not rhythm
+    if (liveBands < 4)
+    {
+#ifdef KEY_SYNC_DEBUG_TEMPO
+        std::fprintf (stderr, "[DBG-tempo] REJECT narrowband liveBands=%d\n", liveBands);
+#endif
+        return;
+    }
+
+    // featureless flux (constant tone/pad: tiny jitter-derived deltas only)
+    double flatRatio = 0.0;
+    {
+        double mean = 0.0;
+        for (double v : odf)
+            mean += v;
+        mean /= (double) odf.size();
+        double var = 0.0;
+        for (double v : odf)
+            var += (v - mean) * (v - mean);
+        flatRatio = mean > 1e-9 ? std::sqrt (var / (double) odf.size()) / mean : 0.0;
+        if (flatRatio < 0.30) // effectively flat flux → "uncertain"
+        {
+#ifdef KEY_SYNC_DEBUG_TEMPO
+            std::fprintf (stderr, "[DBG-tempo] REJECT flat %.3f < 0.30\n", flatRatio);
+#endif
+            return;
+        }
+    }
+
+    // half-rectified flux is >= 0 everywhere; on a full mix every frame carries
+    // some flux, so the ODF baseline (mean^2 term) dominates the raw ACF.
+    // Keep the biased ACF for lag selection (it favors steady-period lags),
+    // but compute pulse confidence on the demeaned ACF where peak/mean is a
+    // true strength measure.
+    double odfBase = 0.0;
+    {
+        double odMean = 0.0;
+        for (double v : odf)
+            odMean += v;
+        odfBase = odMean / (double) odf.size();
+    }
+
+    // x4 linear upsample
+    const int m = int (odf.size() - 1) * 4 + 1;
+    std::vector<double> up ((size_t) m, 0.0);
+    for (int i = 0; i < m; ++i)
+    {
+        const double pos = (double) i / 4.0;
+        const int k = std::min ((int) odf.size() - 1, (int) std::floor (pos));
+        const double frac = pos - (double) k;
+        const double a = odf[(size_t) k];
+        const double b = k + 1 < (int) odf.size() ? odf[(size_t) (k + 1)] : a;
+        up[(size_t) i] = a + (b - a) * frac;
+    }
+
+    // ACF with the tempo clamp; needs at least one lag of headroom
+    const int lagMin = (int) std::ceil (60.0 * fpsUp / 208.0);
+    const int lagMaxAll = (int) std::floor (60.0 * fpsUp / 40.0);
+    const int lagMax = std::min (lagMaxAll, m - (m / 8));
+    if (lagMax <= lagMin)
+    {
+#ifdef KEY_SYNC_DEBUG_TEMPO
+        std::fprintf (stderr, "[DBG-tempo] REJECT window-short lagMax %d <= lagMin %d\n", lagMax, lagMin);
+#endif
+        return;
+    }
+
+    std::vector<double> acf ((size_t) (lagMax - lagMin + 1), 0.0);
+    double acfMean = 0.0;
+    for (int L = lagMin; L <= lagMax; ++L)
+    {
+        double s = 0.0;
+        for (int y = 0; y + L < m; ++y)
+            s += up[(size_t) y] * up[(size_t) (y + L)];
+        acf[(size_t) (L - lagMin)] = s;
+        acfMean += s;
+    }
+    acfMean /= (double) acf.size();
+
+    // lognormal prior around 120 BPM (1 std = 1 octave), applied linearly
+    auto priorAt = [fpsUp] (double lag)
+    {
+        const double bpm = 60.0 * fpsUp / lag;
+        const double o = std::log2 (bpm / 120.0);
+        return std::exp (-0.5 * o * o);
+    };
+
+    int bestI = -1;
+    double bestW = -1.0;
+    for (int i = 0; i < (int) acf.size(); ++i)
+    {
+        const double L = (double) (lagMin + i);
+        const double w = acf[(size_t) i] * priorAt (L);
+        if (w > bestW)
+        {
+            bestW = w;
+            bestI = i;
+        }
+    }
+    if (bestI < 0)
+        return;
+    const double bestAcf = acf[(size_t) bestI];
+    if (bestAcf <= 0.0 || bestW <= 0.0)
+    {
+#ifdef KEY_SYNC_DEBUG_TEMPO
+        std::fprintf (stderr, "[DBG-tempo] REJECT no-positive-periodicity bestAcf=%.4g\n", bestAcf);
+#endif
+        return; // no positive periodicity at all: silence / noise / tape hiss
+    }
+
+    // parabolic refine around the peak
+    double delta = 0.0;
+    if (bestI > 0 && bestI + 1 < (int) acf.size())
+    {
+        const double y1 = acf[(size_t) (bestI - 1)];
+        const double y2 = bestAcf;
+        const double y3 = acf[(size_t) (bestI + 1)];
+        const double den = y1 - 2.0 * y2 + y3;
+        if (std::abs (den) > 1e-12)
+            delta = juce::jlimit (-0.5, 0.5, 0.5 * (y1 - y3) / den);
+    }
+    const double lagRef = (double) (lagMin + bestI) + delta;
+    const double bpm = 60.0 * fpsUp / lagRef;
+
+    // octave check: half/double the lag (same pulse family, per Percival's fix)
+    double rivalW = -1.0;
+    const int rivalLags[] = { (int) std::lround (lagRef / 2.0), (int) std::lround (lagRef * 2.0) };
+    for (int rl : rivalLags)
+    {
+        if (rl < lagMin || rl > lagMax || rl < 1)
+            continue;
+        rivalW = std::max (rivalW, acf[(size_t) (rl - lagMin)] * priorAt ((double) rl));
+    }
+
+    // demean-agnostic pulse confidence: peak/σ over the full lag ACF is
+    // shift-invariant, so the raw (selection) ACF scale serves both jobs.
+    // Recalibrated Oct 2026 on real-music probe runs — see [DBG-tempo].
+    double pkStd = 0.0;
+    double acfVar = 0.0;
+    for (double v : acf)
+        acfVar += (v - acfMean) * (v - acfMean);
+    acfVar = std::sqrt (acfVar / (double) acf.size());
+    pkStd = acfVar > 1e-12 ? (bestAcf - acfMean) / acfVar : 0.0;
+    double conf = juce::jlimit (0.0, 1.0, (pkStd - 0.8) / 1.5);
+    if (rivalW > 0.85 * bestW) // unresolved octave family → flag, don't lie
+        conf *= 0.5;
+
+#ifdef KEY_SYNC_DEBUG_TEMPO
+    {
+        double pk = 0.0;
+        for (double v : acf)
+            pk = std::max (pk, v);
+        std::fprintf (stderr, "[DBG-tempo] flat=%.3f pkStd=%.3f rival=%.3f lag=%.1f bpm=%.2f conf=%.3f\n",
+                      flatRatio, pkStd, rivalW / std::max (bestW, 1e-12), lagRef, bpm, conf);
+    }
+#endif
+
+    out.bpm = (float) bpm;
+    out.bpmConfidence = (float) conf;
 }
 
 bool KeyDetector::hasEnoughAudio() const

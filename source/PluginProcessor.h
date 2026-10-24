@@ -52,12 +52,17 @@ public:
     AnalyzeState getState() const { return state.load (std::memory_order_relaxed); }
     KeyResult getLastResult() const { return lastResult; }
 
+    // true when audio above the silence threshold ran through the plugin since
+    // the displayed result was computed — the shown key may no longer match
+    bool isStale() const { return stale.load (std::memory_order_relaxed); }
+
     void requestAnalysis();
     void performAnalysis();
 
 private:
     KeyDetector detector;
     std::atomic<AnalyzeState> state { AnalyzeState::idle };
+    std::atomic<bool> stale { false }; // real audio seen since last analysis
     KeyResult lastResult;
     std::vector<float> monoScratch;
 };

@@ -28,6 +28,20 @@ juce::String confidencePercent (const KeyResult& r)
     return juce::String (int (r.confidence * 100.0f)) + "%";
 }
 
+// U+00B7 as explicit UTF-8 bytes — raw non-ASCII literals in .cpp turn into "Â·" under MSVC
+const juce::String sepDot (juce::CharPointer_UTF8 ("  \xc2\xb7  "));
+
+// bucket word must use the same threshold the state machine uses
+// (kConfidenceResultPct = what makes an honest Result at all)
+juce::String confidenceWord (float confidence)
+{
+    if (confidence < 0.60f)
+        return "weak";
+    if (confidence < 0.80f)
+        return "medium";
+    return "high";
+}
+
 // simulated glass panel (brief wants glassmorphism; a VST3 cannot blur what is
 // behind it, so this is layered translucency + a hairline border)
 void drawGlass (juce::Graphics& g, juce::Rectangle<float> r)
@@ -58,11 +72,14 @@ KeySyncAudioProcessorEditor::KeySyncAudioProcessorEditor (KeySyncAudioProcessor&
     interSemi = juce::Typeface::createSystemTypefaceFor (BinaryData::InterSemiBold_ttf,
                                                          BinaryData::InterSemiBold_ttfSize);
 
-    auto makeFont = [] (const juce::Typeface::Ptr& tf, float height)
-    { return juce::Font (juce::FontOptions().withTypeface (tf).withHeight (height)); };
+    auto makeFont = [] (const juce::Typeface::Ptr& tf, float height, float kerning = 0.0f)
+    {
+        return juce::Font (juce::FontOptions().withTypeface (tf).withHeight (height)
+                                                  .withKerningFactor (kerning));
+    };
 
     titleFont = makeFont (isometra, 26.0f);
-    keyFont = makeFont (isometra, 58.0f);
+    keyFont = makeFont (interSemi, 52.0f, -0.02f);
 
     addAndMakeVisible (title);
     addAndMakeVisible (keyDisplay);
@@ -99,8 +116,8 @@ void KeySyncAudioProcessorEditor::paint (juce::Graphics& g)
 
     // brand glow, palette-only: warm orange top-right, quiet grey bottom-left
     {
-        juce::ColourGradient orange (juce::Colour (0x2EFF8A24u), 340.0f, 40.0f,
-                                     juce::Colour (0x00FF8A24u), 340.0f, 40.0f + 300.0f, true);
+        juce::ColourGradient orange (juce::Colour (0x1EFF8A24u), 340.0f, 40.0f,
+                                     juce::Colour (0x00FF8A24u), 340.0f, 40.0f + 240.0f, true);
         g.setGradientFill (orange);
         g.fillAll();
     }
@@ -132,29 +149,28 @@ void KeySyncAudioProcessorEditor::TitleBar::paint (juce::Graphics& g)
 {
     const auto b = getLocalBounds().toFloat();
 
-    // waveform logo mark (from the brand sheet)
-    juce::Path wave;
-    static constexpr float pts[] = { 0.0f, 0.55f, 0.08f, 0.40f, 0.16f, 0.60f, 0.24f, 0.25f,
-        0.32f, 0.75f, 0.40f, 0.35f, 0.48f, 0.55f, 0.56f, 0.45f, 0.64f, 0.60f, 0.72f, 0.42f,
-        0.80f, 0.55f, 0.88f, 0.45f, 1.0f, 0.50f };
-    wave.startNewSubPath (b.getX(), b.getY() + pts[1] * b.getHeight());
-    for (int i = 2; i < (int) (sizeof (pts) / sizeof (float)); i += 2)
-        wave.lineTo (b.getX() + pts[i] * 48.0f, b.getY() + pts[i + 1] * b.getHeight());
-    g.setColour (uiColour (kWhite));
-    g.strokePath (wave, juce::PathStrokeType (2.2f, juce::PathStrokeType::curved));
+    // logo mark: assets/logo.png shipped in the binary data (replaces the old
+    // hand-drawn waveform path)
+    auto logo = juce::ImageCache::getFromMemory (BinaryData::logo_png, BinaryData::logo_pngSize);
+    if (logo.isValid())
+        g.drawImage (logo, juce::Rectangle<float> (b.getX() + 2.0f, b.getY() + 10.0f, 84.0f, 36.0f),
+                     juce::RectanglePlacement (juce::RectanglePlacement::centred), false);
 
     // wordmark: "ACE AUDIO" small, "KEY" white + "SYNC" orange in Isometra
-    const float x = b.getX() + 60.0f;
+    const float x = b.getX() + 96.0f;
     g.setFont (fontOf (owner.inter, 10.0f));
     g.setColour (uiColour (kGrey));
     g.drawText ("ACE AUDIO", x, b.getY() + 12.0f, 200.0f, 14.0f, juce::Justification::bottomLeft);
 
+    // width measured, not hardcoded — Isometra metrics are irregular
+    const float keyW = juce::GlyphArrangement::getStringWidth (owner.titleFont, "KEY");
+
     g.setFont (owner.titleFont);
-    // fixed offsets: Isometra "KEY" ≈ 58 px at 26 pt (no width re-measure needed)
     g.setColour (uiColour (kWhite));
-    g.drawText ("KEY", x, b.getY() + 24.0f, 58.0f, 32.0f, juce::Justification::bottomLeft);
+    g.drawText ("KEY", x, b.getY() + 24.0f, keyW + 2.0f, 32.0f, juce::Justification::bottomLeft);
     g.setColour (uiColour (kOrange));
-    g.drawText ("SYNC", x + 58.0f, b.getY() + 24.0f, 110.0f, 32.0f, juce::Justification::bottomLeft);
+    g.drawText ("SYNC", x + keyW + 2.0f, b.getY() + 24.0f, 110.0f, 32.0f,
+                juce::Justification::bottomLeft);
 }
 
 // ---------------------------------------------------------------- KeyDisplay
@@ -187,14 +203,35 @@ void KeySyncAudioProcessorEditor::KeyDisplay::paint (juce::Graphics& g)
         {
             const auto r = owner.processor.getLastResult();
             auto bb = b;
+            auto strip = bb.removeFromBottom (44.0f); // confidence strip
+            auto bpmRow = bb.removeFromBottom (26.0f); // BPM row (BPM is a Free feature)
+
             g.setFont (owner.keyFont);
             g.setColour (uiColour (kWhite));
             g.drawText (keyTitle (r), bb, text);
 
+            // BPM: shown when the detector has an honest claim, else "BPM uncertain"
+            if (r.bpm > 0.0f && r.bpmConfidence >= 0.5f)
+            {
+                g.setFont (fontOf (owner.interSemi, 15.0f));
+                g.setColour (uiColour (kWhite));
+                g.drawText (juce::String (juce::roundToInt (r.bpm)) + " BPM",
+                            bpmRow, text);
+            }
+            else
+            {
+                g.setFont (fontOf (owner.inter, 12.0f));
+                g.setColour (uiColour (kGrey));
+                g.drawText ("BPM uncertain - not enough pulse in this audio", bpmRow, text);
+            }
+
             g.setFont (fontOf (owner.inter, 12.0f));
             g.setColour (uiColour (kGrey));
-            g.drawText ("Confidence " + confidencePercent (r),
-                        bb.removeFromBottom (44.0f), text);
+            juce::String staleNote = owner.processor.isStale()
+                ? sepDot + juce::String ("new audio since analysis") : juce::String();
+            g.drawText (juce::String ("Confidence ") + confidencePercent (r)
+                            + sepDot + confidenceWord (r.confidence) + staleNote,
+                        strip, text);
             break;
         }
         case AnalyzeState::lowConfidence:
@@ -226,22 +263,51 @@ void KeySyncAudioProcessorEditor::KeyDisplay::paint (juce::Graphics& g)
 
 void KeySyncAudioProcessorEditor::AnalyzeButton::paintButton (juce::Graphics& g, bool over, bool down)
 {
-    const auto b = getLocalBounds().toFloat().reduced (0.0f);
-
-    juce::Colour fill = down ? uiColour (kOrange).brighter (0.12f)
-                             : over ? uiColour (kOrange).brighter (0.06f)
-                                    : uiColour (kOrange);
+    const auto b = getLocalBounds().toFloat();
+    const bool busy = owner.processor.getState() == AnalyzeState::analyzing;
 
     juce::Path p;
     p.addRoundedRectangle (b, 14.0f);
-    g.setColour (fill);
-    g.fillPath (p);
-    g.setColour (juce::Colour (0x66ffffffu).withAlpha (down ? 0.0f : 0.25f));
-    g.strokePath (p, juce::PathStrokeType (1.0f));
 
-    g.setFont (fontOf (owner.isometra, 20.0f));
-    g.setColour (juce::Colour (0xff140a03u)); // near-black on orange
-    g.drawText ("ANALYZE", b, juce::Justification::centred);
+    // soft orange under-shadow lifts the button off the navy bg
+    if (! busy)
+    {
+        auto shadow = p;
+        shadow.applyTransform (juce::AffineTransform::translation (0.0f, down ? 1.0f : 3.0f));
+        g.setColour (uiColour (kOrange).withAlpha (down ? 0.18f : 0.30f));
+        g.fillPath (shadow);
+    }
+
+    // vertical sheen: brighter crown into flat brand orange; fades when busy
+    juce::Colour top = busy ? uiColour (kOrange).withAlpha (0.35f)
+                      : down ? uiColour (kOrange).darker (0.12f)
+                      : over ? uiColour (kOrange).brighter (0.12f)
+                             : uiColour (kOrange).brighter (0.05f);
+    juce::Colour bottom = busy ? uiColour (kOrange).withAlpha (0.25f)
+                           : down ? uiColour (kOrange).darker (0.18f)
+                                  : uiColour (kOrange).darker (0.06f);
+    g.setGradientFill (juce::ColourGradient (top, 0.0f, b.getY(),
+                                             bottom, 0.0f, b.getBottom(), false));
+    g.fillPath (p);
+
+    if (! busy)
+    {
+        // 1px inner highlight on the crown + hairline border
+        juce::Rectangle<float> lip = b;
+        lip = lip.removeFromTop (1.2f);
+        g.setColour (juce::Colour (0x40ffffffu));
+        g.fillRect (lip.reduced (12.0f, 0.0f));
+        g.setColour (juce::Colour (0x26ffffffu).withAlpha (down ? 0.05f : 0.15f));
+        g.strokePath (p, juce::PathStrokeType (1.0f));
+    }
+
+    g.setColour (busy ? juce::Colour (0x80140a03u) : juce::Colour (0xff140a03u));
+    g.drawText (busy ? "ANALYZING" : "ANALYZE", b, juce::Justification::centred);
+}
+
+bool KeySyncAudioProcessorEditor::AnalyzeButton::hitTest (int, int)
+{
+    return owner.processor.getState() != AnalyzeState::analyzing;
 }
 
 // ---------------------------------------------------------------- ProPanel
@@ -258,35 +324,27 @@ void KeySyncAudioProcessorEditor::ProPanel::paint (juce::Graphics& g)
 
     const auto r = owner.processor.getLastResult();
     const auto suggestions = recommendCompatibleKeys (r);
-    const bool showSuggestions = kIsProEdition && owner.processor.getState() == AnalyzeState::result && r.valid;
 
-    auto rows = b.removeFromTop (b.getHeight() - (kIsProEdition ? 0.0f : 34.0f)).reduced (0.0f, 6.0f);
+    auto rows = b.reduced (14.0f, 4.0f);
 
-    if (kIsProEdition || showSuggestions) // pro editions always render their list
+    if (kIsProEdition)
     {
-        if (owner.processor.getState() == AnalyzeState::lowConfidence)
+        if (owner.processor.getState() != AnalyzeState::result || ! r.valid)
         {
-            g.setFont (fontOf (owner.inter, 12.0f));
+            g.setFont (fontOf (owner.inter, 13.0f));
             g.setColour (uiColour (kGrey));
-            g.drawText ("Suggestions shown despite low confidence", rows, juce::Justification::centredTop);
+            g.drawText ("Analyze to see compatible keys", rows, juce::Justification::centred);
         }
 
-        const int rowsH = 36;
-        for (size_t i = 0; i < suggestions.size(); ++i)
+        const int rowsH = (int) rows.getHeight() / 4; // rows fill the panel, no dead space
+        for (size_t i = 0; i < suggestions.size() && i < 4; ++i)
         {
             auto row = rows.removeFromTop ((float) rowsH);
-            if (i >= 4)
-                break; // brief: up to 5 entries total incl. spacing allowed, keep 4 core rows
-
-            g.setFont (fontOf (owner.isometra, 20.0f));
-            g.setColour (uiColour (kWhite));
-            g.drawText (juce::String (pitchClassName (suggestions[i].tonicPc)) + " "
-                            + modeName (suggestions[i].mode),
-                        row, juce::Justification::centredLeft);
 
             // relationship chip, right aligned
             const float chipW = 118.0f;
-            auto chip = row.removeFromRight (chipW).reduced (0.0f, 6.0f);
+            auto chip = row.removeFromRight (chipW + 8.0f)
+                             .withSizeKeepingCentre (chipW, 28.0f);
             juce::Path cp;
             cp.addRoundedRectangle (chip, chip.getHeight() * 0.5f);
             g.setColour (uiColour (kOrange).withAlpha (0.14f));
@@ -294,6 +352,12 @@ void KeySyncAudioProcessorEditor::ProPanel::paint (juce::Graphics& g)
             g.setFont (fontOf (owner.inter, 11.0f));
             g.setColour (uiColour (kOrange));
             g.drawText (suggestions[i].relationship, chip, juce::Justification::centred);
+
+            g.setFont (fontOf (owner.interSemi, 18.0f));
+            g.setColour (uiColour (kWhite));
+            g.drawText (juce::String (pitchClassName (suggestions[i].tonicPc)) + " "
+                            + modeName (suggestions[i].mode),
+                        row, juce::Justification::centredLeft);
         }
     }
     else if (! kIsProEdition)
@@ -316,6 +380,21 @@ void KeySyncAudioProcessorEditor::ProPanel::paint (juce::Graphics& g)
             g.fillPath (rp);
         }
     }
+}
+
+// row index under the mouse -> plain-language gloss on the relationship chip
+void KeySyncAudioProcessorEditor::ProPanel::hoverRow()
+{
+    // must stay in sync with paint(): header 30px, then rows padded 4px
+    const int rowsH = juce::jmax (1, (getHeight() - 30 - 8) / 4);
+    const int row = (int) (getMouseXYRelative().getY() - (30 + 4)) / rowsH;
+    static constexpr const char* gloss[4] = {
+        "Relative: same notes, opposite feel - always compatible",
+        "Dominant: cadence tension, pulls home to this key",
+        "Subdominant: colour change, shares most notes",
+        "Parallel: same root, major/minor swapped",
+    };
+    setTooltip (row >= 0 && row < 4 ? juce::String (gloss[row]) : juce::String());
 }
 
 } // namespace keysync

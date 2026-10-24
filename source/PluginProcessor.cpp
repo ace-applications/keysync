@@ -39,6 +39,14 @@ void KeySyncAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
             mono[i] = 0.5f * (buffer.getReadPointer (0)[i] + buffer.getReadPointer (1)[i]);
 
     detector.addMono (mono, numSamples);
+
+    // staleness: any audio above the silence floor invalidates the shown result
+    float energy = 0.0f;
+    for (int i = 0; i < numSamples; ++i)
+        energy = std::max (energy, std::abs (mono[i]));
+
+    if (energy >= KeyDetector::kRmsThreshold)
+        stale.store (true, std::memory_order_relaxed);
 }
 
 void KeySyncAudioProcessor::requestAnalysis()
@@ -46,6 +54,7 @@ void KeySyncAudioProcessor::requestAnalysis()
     if (state.load (std::memory_order_relaxed) == AnalyzeState::analyzing)
         return;
 
+    stale.store (false, std::memory_order_relaxed);
     state.store (AnalyzeState::analyzing, std::memory_order_relaxed);
 }
 
@@ -59,6 +68,7 @@ void KeySyncAudioProcessor::performAnalysis()
     }
 
     lastResult = detector.detect();
+    stale.store (false, std::memory_order_relaxed); // result now reflects current audio
 
     if (! lastResult.valid)
         state.store (AnalyzeState::noUsableAudio, std::memory_order_relaxed);

@@ -14,6 +14,7 @@ FetchContent_MakeAvailable(JUCE)
 
 juce_add_binary_data(KeySyncAssets
     SOURCES
+        assets/logo.png
         assets/fonts/Isometra-Regular.ttf
         assets/fonts/Inter-Regular.ttf
         assets/fonts/Inter-SemiBold.ttf)
@@ -74,3 +75,13 @@ add_executable(keysync_selftest
     source/dsp/Recommender.cpp)
 target_compile_definitions(keysync_selftest PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
 target_link_libraries(keysync_selftest PRIVATE juce::juce_audio_basics juce::juce_dsp)
+
+# dev-only CLI probe: run the detector on real audio files for diagnosis
+add_executable(keysync_probe
+    source/TempoProbe.cpp
+    source/dsp/KeyDetector.cpp
+    source/dsp/Recommender.cpp)
+target_compile_definitions(keysync_probe PRIVATE
+    JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 KEY_SYNC_DEBUG_TEMPO=1)
+target_link_libraries(keysync_probe PRIVATE
+    juce::juce_audio_basics juce::juce_dsp juce::juce_audio_formats)

@@ -27,6 +27,11 @@ std::vector<float> renderNote (double sampleRate, double freq, double seconds, f
 
 double midiToFreq (double midi) { return 440.0 * std::pow (2.0, (midi - 69.0) / 12.0); }
 
+bool closeTo (double got, double want)
+{
+    return got > 0.0 && std::abs (got - want) <= want * 0.08; // MIREX ±8% tier
+}
+
 // renders a scale: sequential notes over ~4 seconds
 void renderScale (double sampleRate, int tonicMidi, bool minor, std::vector<float>& out)
 {
@@ -122,6 +127,127 @@ int main()
     {
         KeyResult bad; bad.valid = false;
         CHECK (recommendCompatibleKeys (bad).empty(), "no suggestions for invalid result");
+    }
+
+    // ---------------- BPM (free feature) ----------------
+    // click-train fixture: 15 s of quarter-note impulses
+    auto renderClicks = [sr] (double bpm, double seconds = 15.0)
+    {
+        std::vector<float> out ((size_t) (seconds * sr), 0.0f);
+        const double periodSamples = 60.0 * sr / bpm;
+        for (double beat = 0.0; beat * periodSamples + 3.0 < (double) out.size(); beat += 1.0)
+        {
+            auto& at = out[(size_t) (beat * periodSamples)];
+            out[(size_t) (beat * periodSamples + 1)] = 0.8f;
+            at = 0.8f;
+            out[(size_t) (beat * periodSamples + 2)] = -0.4f;
+        }
+        return out;
+    };
+
+    for (const double bpmFixture : { 90.0, 120.0, 140.0 })
+    {
+        const auto r = detectRendered (sr, renderClicks (bpmFixture));
+        const bool close = r.bpm > 0.0f && std::abs (r.bpm - bpmFixture) <= bpmFixture * 0.08;
+        CHECK (close && r.bpmConfidence >= 0.5f,
+               ("click train " + std::to_string ((int) bpmFixture) + " BPM found, got "
+                + std::to_string (r.bpm)).c_str());
+    }
+
+    // octave family: eighth-note density at 120 still lands on the 120 family
+    {
+        const auto r = detectRendered (sr, renderClicks (240.0)); // 8ths of 120
+        const bool family = closeTo (r.bpm, 120.0) || closeTo (r.bpm, 240.0)
+                         || closeTo (r.bpm, 60.0);
+        CHECK (r.bpm > 0.0f && family,
+               ("eighth-note density lands in 120 family, got " + std::to_string (r.bpm)).c_str());
+    }
+
+    // silence: no tempo claim at all
+    {
+        KeyDetector d; d.prepare (sr);
+        CHECK (d.detect().bpm == 0.0f, "silence yields no BPM claim");
+    }
+
+    // sustained sine (pad): flux ~ flat, tempo must be flagged uncertain
+    {
+        const auto r = detectRendered (sr, renderNote (sr, midiToFreq (69.0), 15.0));
+        CHECK (r.bpmConfidence < 0.5f,
+               ("sustained sine yields uncertain BPM (conf "
+                + std::to_string (r.bpmConfidence) + ")").c_str());
+    }
+
+    // mixed content: kick pulse under a sustained bassline (real-music-ish level)
+    // window is 30 s now, so fixtures should cover the whole window
+    {
+        std::vector<float> mix = renderClicks (128.0, 30.0);
+        const std::vector<float> bass = renderNote (sr, midiToFreq (36), 30.0, 0.12f);
+        for (size_t i = 0; i < mix.size() && i < bass.size(); ++i)
+            mix[i] += bass[i] * 0.8f;
+        const auto r = detectRendered (sr, mix);
+        CHECK (r.bpm > 0.0f && closeTo (r.bpm, 128.0) && r.bpmConfidence >= 0.5f,
+               ("mixed kick+bass lands 128 BPM with real confidence, got "
+                + std::to_string (r.bpm) + " conf " + std::to_string (r.bpmConfidence)).c_str());
+    }
+
+    // dense pop realism: kick with decay every beat, snare on 2/4, hats on 8ths,
+    // bass line, pad chord — the kind of mix the user reports failing
+    {
+        const double bpmFixture = 124.0;
+        const int numSamples = (int) (30.0 * sr);
+        std::vector<float> mix ((size_t) numSamples, 0.0f);
+        const double beatLen = 60.0 / bpmFixture * sr;
+
+        // kick: pitch-dropping thump each beat
+        for (double beat = 0.0; beat * beatLen + 4000.0 < (double) numSamples; beat += 1.0)
+            for (int i = 0; i < 4000; ++i)
+            {
+                const double t = (double) i / sr;
+                mix[(size_t) (beat * beatLen) + (size_t) i] +=
+                    0.9f * (float) std::exp (-t * 18.0)
+                        * (float) std::sin (juce::MathConstants<double>::twoPi * 55.0 * t);
+            }
+        // snare: noise burst on beats 2 and 4
+        for (double beat = 1.0; beat * beatLen + 3000.0 < (double) numSamples; beat += 2.0)
+        {
+            unsigned seed = (unsigned) (beat * 7.0);
+            for (int i = 0; i < 3000; ++i)
+            {
+                seed = seed * 1664525u + 1013904223u;
+                const float n = (float) (seed >> 16) / 32768.0f - 1.0f;
+                const float decay = (float) std::exp (-((double) i / sr) * 22.0);
+                mix[(size_t) (beat * beatLen) + (size_t) i] += 0.5f * n * decay;
+            }
+        }
+        // hats: short noise ticks on 8ths
+        for (double eighth = 0.0; eighth * beatLen * 0.5 + 2000.0 < (double) numSamples; eighth += 1.0)
+        {
+            unsigned seed = 12345u + (unsigned) (eighth * 13.0);
+            for (int i = 0; i < 1500; ++i)
+            {
+                seed = seed * 1664525u + 1013904223u;
+                const float n = (float) (seed >> 16) / 65535.0f - 1.0f;
+                const float decay = (float) std::exp (-((double) i / sr) * 60.0);
+                mix[(size_t) (eighth * beatLen * 0.5) + (size_t) i] += 0.18f * n * decay;
+            }
+        }
+        // bass + pad: sustained content under the drums
+        const double chunk = beatLen; // one note per beat
+        for (double beat = 0.0; beat * chunk + chunk < (double) numSamples; beat += 4.0)
+        {
+            const int midi = 36 + (int) beat % 4 * 3; // slow movement
+            const int from = std::min (numSamples - 1, (int) (beat * chunk));
+            const int len = std::min (numSamples - from, (int) chunk);
+            for (int i = 0; i < len; ++i)
+                mix[(size_t) (from + i)] += 0.14f * (float) std::sin (
+                    juce::MathConstants<double>::twoPi * midiToFreq (midi) * ((double) i / sr)
+                    + (double) from / sr * juce::MathConstants<double>::twoPi * midiToFreq (midi));
+        }
+
+        const auto r = detectRendered (sr, mix);
+        CHECK (r.bpm > 0.0f && closeTo (r.bpm, bpmFixture) && r.bpmConfidence >= 0.5f,
+               ("dense pop mix lands ~124 BPM confident, got "
+                + std::to_string (r.bpm) + " conf " + std::to_string (r.bpmConfidence)).c_str());
     }
 
     std::printf (failures == 0 ? "\nall checks passed\n" : "\n%d FAILURES\n", failures);

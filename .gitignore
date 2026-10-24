@@ -3,3 +3,7 @@ build/
 *.log
 .vs/
 *.user
+.opencode/
+.agents/
+.github/
+.impeccable/
