@@ -1,5 +1,20 @@
 # Vocal/choir robustness for Krumhansl-Schmuckler key detection
 
+> **Ground-truth probe results (Oct 25, `music/` 4 labeled tracks, 5-window
+> scan via `keysync_probe`).** K-S (shipped): A Long December F major 4/5 ✓,
+> Selah A minor 5/5 ✓ (gospel choir material detects cleanly), Dark Fantasy
+> D minor/A minor tie against an F major label (relative-mode confusion, the
+> known ~65% mode accuracy limit), Immortal A minor 2/5 against C major label
+> (chorus-heavy window splitting). Albrecht-Shanahan 2013 profiles A/B'd from
+> values in the MIT-licensed `justkeydding` `keyprofile.cc`: consensus slightly
+> more coherent (Dark Fantasy D minor 3/5, Immortal tie C/Am) but the tail
+> window — what a live plugin user actually sees during playback — regressed
+> sharply (Mr. Rager A major 0.831 → 0.582, Selah 0.905 → 0.495 wrong), and the
+> synthetic voiced fixture flipped red. A K-S∨A&S ensemble also rejected: the
+> max picks whichever profile fits noise on a wrong key (Tequila A# major conf
+> rose from 0.513 to 0.659). Verdict: keep K-S; the profile swap is documented
+> here for a future re-test with a larger labeled corpus.
+
 > **Implementation outcome (Oct 2026).** Path A was implemented in `KeyDetector`
 > and A/B-tested against a synthetic voiced fixture (A minor scale, vibrato +
 > detuned double) and three real sung tracks via the `keysync_probe` CLI.
