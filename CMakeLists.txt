@@ -82,6 +82,6 @@ add_executable(keysync_probe
     source/dsp/KeyDetector.cpp
     source/dsp/Recommender.cpp)
 target_compile_definitions(keysync_probe PRIVATE
-    JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 KEY_SYNC_DEBUG_TEMPO=1)
+    JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 KEY_SYNC_DEBUG_TEMPO=1 KEY_SYNC_DEBUG_KEY=1)
 target_link_libraries(keysync_probe PRIVATE
     juce::juce_audio_basics juce::juce_dsp juce::juce_audio_formats)

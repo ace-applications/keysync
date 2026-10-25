@@ -52,6 +52,46 @@ void renderScale (double sampleRate, int tonicMidi, bool minor, std::vector<floa
     }
 }
 
+std::vector<float> renderVoicedNote (double sampleRate, double freq, double seconds,
+                                     float amp, double vibratoCents, double vibHz)
+{
+    std::vector<float> out ((size_t) (seconds * sampleRate));
+    for (size_t i = 0; i < out.size(); ++i)
+    {
+        const double t = (double) i / sampleRate;
+        // vibrato pitch wobble + a detuned double (choir-spread voice)
+        const double cents = vibratoCents * std::sin (juce::MathConstants<double>::twoPi * vibHz * t);
+        const double f = freq * std::pow (2.0, cents / 1200.0);
+        const double f2 = freq * std::pow (2.0, (-vibratoCents * 0.6
+            + 18.0 * std::sin (juce::MathConstants<double>::twoPi * (vibHz * 1.13) * t)) / 1200.0);
+        out[i] = amp * 0.5f * (float) (std::sin (juce::MathConstants<double>::twoPi * f * t)
+            + 0.3 * std::sin (juce::MathConstants<double>::twoPi * 2.0 * f * t)
+            + 0.35 * std::sin (juce::MathConstants<double>::twoPi * f2 * t)
+            + 0.10 * std::sin (juce::MathConstants<double>::twoPi * 3.0 * f * t));
+    }
+    return out;
+}
+
+// scale of voiced (vibrato + detune) notes, like a small sung ensemble
+void renderVoicedScale (double sampleRate, int tonicMidi, bool minor, std::vector<float>& out)
+{
+    static const int majorSteps[] = { 0, 2, 4, 5, 7, 9, 11, 12 };
+    static const int minorSteps[] = { 0, 2, 3, 5, 7, 8, 10, 12 };
+    const int* steps = minor ? minorSteps : majorSteps;
+    for (int s = 0; s < 8; ++s)
+    {
+        auto note = renderVoicedNote (sampleRate, midiToFreq (tonicMidi + steps[s]), 0.45,
+                                      0.3f, 20.0, 5.4);
+        out.insert (out.end(), note.begin(), note.end());
+    }
+    for (int s = 0; s < 8; ++s)
+    {
+        auto note = renderVoicedNote (sampleRate, midiToFreq (tonicMidi + steps[s]), 0.45,
+                                      0.15f, 15.0, 4.7);
+        out.insert (out.end(), note.begin(), note.end());
+    }
+}
+
 int failures = 0;
 
 #define CHECK(cond, msg)                                              \
@@ -124,6 +164,17 @@ int main()
         CHECK (rec.size() >= 3 && rec[0].tonicPc == 0 && rec[0].mode == 0,
                "A minor first suggestion is C major (Relative major)");
     }
+    // voiced (vibrato + choir-spread) A minor: sung texture must not break the key
+    {
+        std::vector<float> voiced;
+        renderVoicedScale (sr, 45, true, voiced); // A2 minor
+        const auto r = detectRendered (sr, voiced);
+        CHECK (r.valid && r.tonicPc == 9 && r.mode == 1 && r.confidence > 0.2f,
+               ("voiced A minor survives vibrato/detune, got "
+                + std::string (r.tonicPc >= 0 ? (std::string (pitchClassName (r.tonicPc)) + " " + r.modeText()) : "invalid")
+                + " conf " + std::to_string (r.confidence)).c_str());
+    }
+
     {
         KeyResult bad; bad.valid = false;
         CHECK (recommendCompatibleKeys (bad).empty(), "no suggestions for invalid result");

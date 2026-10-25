@@ -81,9 +81,9 @@ private:
     bool tryReadFrame (const ChromaSlot& slot, ChromaSlot& out) const;
 
     void processPendingFrames();
-    static void chromaFromFrame (const float* fftData, int fftSize, double sampleRate,
-                                 std::array<float, kNumPitchClasses>& chroma,
-                                 std::array<float, kTempoBands>& bands);
+    void chromaFromFrame (const float* fftData, int fftSize, double sampleRate,
+                          std::array<float, kNumPitchClasses>& chroma,
+                          std::array<float, kTempoBands>& bands);
     void estimateTempo (const std::vector<std::array<float, kTempoBands>>& bandFrames,
                         KeyResult& out) const;
 
@@ -94,6 +94,8 @@ private:
     std::vector<float> pending;           // sample FIFO
     std::vector<float> frameData;         // FFT workspace (kFftSize * 2)
     int pendingSize = 0;
+
+    std::vector<double> frameMags;        // per-frame magnitudes (audio-thread scratch)
 
     std::unique_ptr<ChromaSlot[]> frameRing;  // one published frame per active hop
     int ringCapacity = 0;                     // slots in frameRing

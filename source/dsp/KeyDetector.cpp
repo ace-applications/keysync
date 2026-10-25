@@ -64,6 +64,7 @@ void KeyDetector::prepare (double newSampleRate)
     pending.assign ((size_t) kFftSize + (size_t) kMaxBlockSamples, 0.0f);
     pendingSize = 0;
     frameData.assign ((size_t) kFftSize * 2, 0.0f);
+    frameMags.assign ((size_t) kFftSize / 2 + 1, 0.0);
 
     const int windowFrames = (int) std::ceil ((kAnalysisWindowSeconds * sampleRate) / (double) kHopSize) + 4;
     ringCapacity = windowFrames;
@@ -136,24 +137,36 @@ void KeyDetector::processPendingFrames()
     }
 }
 
+// chroma from one FFT frame. Vocal-robustness journey (see docs/research/
+// vocal-key-detection.md and the A/B notes there): Stowell whitening, librosa
+// tuning estimation, fractional bin splitting and HPCP magnitude compression
+// all REGRESSED real music and were removed; the survivor is the max-per-class
+// chroma view consumed by detect() alongside the mean view.
 void KeyDetector::chromaFromFrame (const float* fftData, int fftSize, double sr,
                                    std::array<float, kNumPitchClasses>& chroma,
                                    std::array<float, kTempoBands>& bands)
 {
     chroma = {};
     bands = {};
-    double sum = 0.0;
-    for (int bin = 0; bin < fftSize / 2; ++bin)
+    const int halfBins = fftSize / 2;
+
+    // magnitudes, in one pass
+    std::vector<double>& mags = frameMags;
+    for (int bin = 0; bin < halfBins; ++bin)
     {
-        const double re = (double) fftData[2 * bin];
-        const double im = (double) fftData[2 * bin + 1];
-        const double mag = std::sqrt (re * re + im * im);
+        const double re = fftData[2 * bin];
+        const double im = fftData[2 * bin + 1];
+        mags[bin] = std::sqrt (re * re + im * im);
+    }
+    double sum = 0.0;
+    for (int bin = 0; bin < halfBins; ++bin)
+    {
+        double mag = mags[bin];
         if (mag <= 0.0)
             continue;
-
         const double freq = (double) bin * sr / (double) fftSize;
 
-        // tempo bands: 32 log-spaced bins, 35 Hz - 8 kHz (magitudes kept loud)
+        // tempo bands consume raw magnitudes
         if (freq >= 35.0 && freq <= 8000.0)
         {
             const int band = juce::jlimit (0, kTempoBands - 1,
@@ -161,19 +174,21 @@ void KeyDetector::chromaFromFrame (const float* fftData, int fftSize, double sr,
             bands[(size_t) band] += (float) mag;
         }
 
-        if (freq < 55.0 || freq > 4000.0) // tonal range for pop music, skip rumble/hiss
+        // chroma: middle-octave weighting, snapped to nearest semitone class
+        if (freq < 55.0 || freq > 4000.0)
             continue;
 
-        // gentle octave weighting: favour the middle octaves
         const double midi = 69.0 + 12.0 * std::log2 (freq / 440.0);
+
         const double octaveWeight = (midi < 48.0 || midi > 84.0) ? 0.5 : 1.0;
 
-        chroma[(size_t) wrapPc ((int) std::lround (midi))] += (float) (mag * octaveWeight);
-        sum += mag;
+        const int cls = ((int) std::lround (midi) % 12 + 12) % 12;
+        chroma[(size_t) cls] += (float) (mag * octaveWeight);
+        sum += mag * octaveWeight;
     }
     if (sum > 0.0)
-        for (float& c : chroma)
-            c /= (float) sum; // per-frame normalisation, loudness independent
+        std::for_each (chroma.begin(), chroma.end(),
+                       [sum] (float& c) { c /= (float) sum; });
 }
 // seqlock read pattern — false when the frame is unpublished or mid-write
 bool KeyDetector::tryReadFrame (const ChromaSlot& slot, ChromaSlot& out) const
@@ -211,6 +226,7 @@ KeyResult KeyDetector::detect() const
     KeyResult out;
 
     std::array<double, kNumPitchClasses> avg {};
+    std::array<double, kNumPitchClasses> maxc {}; // max per class across frames
     int count = 0;
     ChromaSlot tmp;
     std::vector<std::array<float, kNumPitchClasses>> chromaFrames;
@@ -223,7 +239,11 @@ KeyResult KeyDetector::detect() const
             if (frameHasContent (tmp.chroma))
             {
                 for (int pc = 0; pc < kNumPitchClasses; ++pc)
+                {
                     avg[(size_t) pc] += tmp.chroma[(size_t) pc];
+                    maxc[(size_t) pc] = std::max (maxc[(size_t) pc],
+                                                  (double) tmp.chroma[(size_t) pc]);
+                }
                 ++count;
             }
             chromaFrames.push_back (tmp.chroma); // full time grid for the tempo stage
@@ -244,6 +264,19 @@ KeyResult KeyDetector::detect() const
 
     out.valid = true;
 
+    // two chroma view selection: mean for steady instrument material, max-per-
+    // class for vibrato/choir smear (the pitch-crossing frames give sharp class
+    // peaks; the mean washes them flat). The profile correlation decides.
+    {
+        double maxEnergy = 0.0;
+        for (int pc = 0; pc < kNumPitchClasses; ++pc)
+            maxEnergy += maxc[(size_t) pc];
+        if (maxEnergy > 1e-9)
+            for (double& v : maxc)
+                v /= maxEnergy;
+    }
+    const std::array<double, kNumPitchClasses> meanView = avg;
+
     double bestR = -2.0, secondR = -2.0;
     for (int rotate = 0; rotate < kNumPitchClasses; ++rotate)
     {
@@ -253,7 +286,9 @@ KeyResult KeyDetector::detect() const
             for (int i = 0; i < kNumPitchClasses; ++i)
                 profile[(i + rotate) % 12] = (mode == 0 ? kMajorProfile : kMinorProfile)[i];
 
-            const double r = correlation (avg.data(), profile);
+            const double rMean = correlation (meanView.data(), profile);
+            const double rMax = correlation (maxc.data(), profile);
+            const double r = std::max (rMean, rMax);
             if (r > bestR)
             {
                 secondR = bestR;
@@ -272,6 +307,40 @@ KeyResult KeyDetector::detect() const
     const double margin = std::max (0.0, bestR - secondR);
     const double certainty = std::min (1.0, margin / 0.10);
     out.confidence = (float) juce::jlimit (0.0, 1.0, bestR * (0.55 + 0.45 * certainty));
+
+#ifdef KEY_SYNC_DEBUG_KEY
+    {
+        // full score table + the chroma fingerprint the decision came from
+        std::fprintf (stderr, "[DBG-key] count=%d energy=%.3f best=%.3f second=%.3f -> %s %s (conf %.3f)\n",
+                      count, energy, bestR, secondR,
+                      pitchClassName (out.tonicPc), out.modeText(), out.confidence);
+        std::fprintf (stderr, "[DBG-key] chroma:");
+        for (int pc = 0; pc < kNumPitchClasses; ++pc)
+            std::fprintf (stderr, " %s=%.3f", pitchClassName (pc), avg[(size_t) pc]);
+        std::fprintf (stderr, "\n");
+        struct Score { double r; int tonic; int mode; };
+        Score top[3] = { { -2.0, -1, -1 }, { -2.0, -1, -1 }, { -2.0, -1, -1 } };
+        for (int rotate = 0; rotate < kNumPitchClasses; ++rotate)
+            for (int mode = 0; mode < 2; ++mode)
+            {
+                double profile[kNumPitchClasses];
+                for (int i = 0; i < kNumPitchClasses; ++i)
+                    profile[(i + rotate) % 12] = (mode == 0 ? kMajorProfile : kMinorProfile)[i];
+                const double r = std::max (correlation (avg.data(), profile),
+                                           correlation (maxc.data(), profile));
+                if (r > top[0].r)
+                    { top[2] = top[1]; top[1] = top[0]; top[0] = { r, rotate, mode }; }
+                else if (r > top[1].r)
+                    { top[2] = top[1]; top[1] = { r, rotate, mode }; }
+                else if (r > top[2].r)
+                    top[2] = { r, rotate, mode };
+            }
+        for (const auto& t : top)
+            if (t.tonic >= 0)
+                std::fprintf (stderr, "[DBG-key]   r=%.4f %s %s\n",
+                              t.r, pitchClassName (t.tonic), modeName (t.mode));
+    }
+#endif
 
     // tempo stage — independent of the key fields above; stays 0/0 when unsure
     estimateTempo (bandFrames, out);
