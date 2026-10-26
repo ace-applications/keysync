@@ -12,36 +12,8 @@ namespace
 constexpr const char* kPitchNames[kNumPitchClasses] =
     { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
 
-// Krumhansl-Schmuckler key profiles.
-constexpr double kMajorProfile[kNumPitchClasses] =
-    { 6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88 };
-constexpr double kMinorProfile[kNumPitchClasses] =
-    { 6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17 };
-
-// Pearson correlation of two 12-bin vectors.
-double correlation (const double* a, const double* b)
-{
-    double meanA = 0.0, meanB = 0.0;
-    for (int i = 0; i < kNumPitchClasses; ++i)
-    {
-        meanA += a[i];
-        meanB += b[i];
-    }
-    meanA /= (double) kNumPitchClasses;
-    meanB /= (double) kNumPitchClasses;
-
-    double num = 0.0, denA = 0.0, denB = 0.0;
-    for (int i = 0; i < kNumPitchClasses; ++i)
-    {
-        const double da = a[i] - meanA;
-        const double db = b[i] - meanB;
-        num += da * db;
-        denA += da * da;
-        denB += db * db;
-    }
-    const double den = std::sqrt (denA) * std::sqrt (denB);
-    return den > 0.0 ? num / den : 0.0;
-}
+// (Krumhansl-Schmuckler key profiles + Pearson correlation live in the header —
+// exposed for probe-side melody-fusion experiments.)
 } // namespace
 
 const char* pitchClassName (int pc) { return kPitchNames[wrapPc (pc)]; }
@@ -86,6 +58,25 @@ void KeyDetector::prepare (double newSampleRate)
     chromaRingCapacity = chromaWindowFrames;
     chromaRing.reset (new ChromaSlotTight[(size_t) chromaWindowFrames]);
     chromaRingWrite = 0;
+
+    // melody lane ring shares the tempo ring's capacity (same hop cadence)
+    melodyRing.reset (new MelodySlot[(size_t) windowFrames]);
+    melodyRingWrite = 0;
+    melodyPeakMag.assign ((size_t) kFftSize / 2 + 1, 0.0);
+    for (int row = 0; row < kMelodyRows; ++row)
+    {
+        const double f0 = 440.0 * std::pow (2.0, (double) (kMidiMelLow + row - 69) / 12.0);
+        for (int h = 1; h <= kMelodyHarmonics; ++h)
+        {
+            const int bin = (int) std::lround (f0 * (double) h * (double) kFftSize / sampleRate);
+            melodyRowBin[(size_t) ((h - 1) * kMelodyRows + row)] =
+                bin < kFftSize / 2 ? bin : -1;
+        }
+    }
+    melodyMaxEma = 0.0;
+    melodyPrevRow = -1;
+    melodyRowF = 0.0f;
+    melodySal.fill (0.0f);
 }
 
 void KeyDetector::reset()
@@ -101,6 +92,13 @@ void KeyDetector::reset()
         frameRing[(size_t) i].seq.store (0, std::memory_order_release);
     for (int i = 0; i < chromaRingCapacity; ++i)
         chromaRing[(size_t) i].seq.store (0, std::memory_order_release);
+    melodyRingWrite = 0;
+    for (int i = 0; i < ringCapacity; ++i)
+        melodyRing[(size_t) i].seq.store (0, std::memory_order_release);
+    melodyMaxEma = 0.0;
+    melodyPrevRow = -1;
+    melodyRowF = 0.0f;
+    melodySal.fill (0.0f);
 }
 
 void KeyDetector::addMono (const float* samples, int numSamples)
@@ -155,9 +153,10 @@ void KeyDetector::processPendingFrames()
             sqrSum += (double) pending[(size_t) i] * (double) pending[(size_t) i];
         const double rms = std::sqrt (sqrSum / (double) kFftSize);
 
-        // tempo-ring frames publish on a uniform time grid; the chroma word
-        // is unused (the chroma branch has its own ring at sampleRate/4)
+        // tempo-ring frames publish on a uniform time grid; melody slots ride
+        // the SAME cadence (voiced flag 0 when silent)
         std::array<float, kTempoBands> bands {};
+        MelodySample mel;
         if (rms >= kRmsThreshold)
         {
             for (int i = 0; i < kFftSize; ++i)
@@ -171,6 +170,7 @@ void KeyDetector::processPendingFrames()
             std::array<float, kTempoBands> bandsTmp {};
             chromaFromFrame (frameData.data(), kFftSize, sampleRate, chromaTmp, bandsTmp);
             bands = bandsTmp;
+            processMelodyFrame (frameMags, mel);
         }
 
         // seqlock publish: book a slot, mark in-progress, fill, mark stable
@@ -180,6 +180,17 @@ void KeyDetector::processPendingFrames()
         slot.chroma = {};
         slot.bands = bands;
         slot.seq.fetch_add (1, std::memory_order_release);    // even: stable
+
+        // melody slot on the same uniform grid
+        {
+            auto& ms = melodyRing[(size_t) melodyRingWrite];
+            melodyRingWrite = (melodyRingWrite + 1) % ringCapacity;
+            ms.seq.fetch_add (1, std::memory_order_release);
+            ms.row = mel.row;
+            ms.conf = mel.conf;
+            ms.voiced = mel.voiced;
+            ms.seq.fetch_add (1, std::memory_order_release);
+        }
 
         // shift the next hop of samples to the front
         const int remaining = pendingSize - kHopSize;
@@ -226,6 +237,81 @@ void KeyDetector::processChromaPendingFrames()
                       sizeof (float) * (size_t) remaining);
         chromaPendingSize = remaining;
     }
+}
+
+// melody tracker, one salience grid per full-rate frame (docs/research/
+// melody-analysis.md). Display-only: the predominant-line row streams into the
+// Pro lane; it never feeds the key stage (probe-verified fusion verdict).
+void KeyDetector::processMelodyFrame (const std::vector<double>& mags, MelodySample& melOut)
+{
+    melOut = {}; // default unvoiced; overwritten below when voiced
+    const int halfBins = kFftSize / 2;
+
+    // spectral peaks only — raw bins fold broadband energy into the melody
+    double peakMax = 0.0;
+    for (int bin = 1; bin < halfBins - 1; ++bin)
+        peakMax = std::max (peakMax, mags[(size_t) bin]);
+    if (peakMax < 1e-9)
+        return;
+    for (int bin = 1; bin < halfBins - 1; ++bin)
+    {
+        const double m = mags[(size_t) bin];
+        melodyPeakMag[(size_t) bin] =
+            (m > mags[(size_t) bin - 1] && m >= mags[(size_t) bin + 1]
+             && m > kMelodyPeakFloorRatio * peakMax) ? m : 0.0;
+    }
+    melodyPeakMag[0] = melodyPeakMag[(size_t) halfBins] = 0.0;
+
+    for (int row = 0; row < kMelodyRows; ++row)
+    {
+        float s = 0.0f, weight = 1.0f;
+        for (int h = 1; h <= kMelodyHarmonics; ++h)
+        {
+            const int bin = melodyRowBin[(size_t) ((h - 1) * kMelodyRows + row)];
+            if (bin > 0 && melodyPeakMag[(size_t) bin] > 0.0)
+                s += (float) melodyPeakMag[(size_t) bin] * weight;
+            weight *= kMelodyHarmonicDecay;
+        }
+        melodySal[(size_t) row] = s;
+    }
+
+    float curMax = 0.0f;
+    int arg = 0;
+    for (int row = 0; row < kMelodyRows; ++row)
+        if (melodySal[(size_t) row] > curMax) { curMax = melodySal[(size_t) row]; arg = row; }
+
+    // running max keeps the voicing gate level-adaptive (quiet intros stay live)
+    melodyMaxEma = std::max (curMax,
+        melodyMaxEma == 0.0f ? curMax : melodyMaxEma + kMelodyMaxEma * (curMax - melodyMaxEma));
+    if (melodyMaxEma < 1e-9f || curMax < kMelodyVoicingRatio * melodyMaxEma)
+        return; // unvoiced frame: slot stays silent (published by the caller)
+
+    // continuity bias toward +-2 semitone of the previous row (the octave-jump
+    // mitigation; full Melodia subgrouping is out of v1 scope)
+    int best = arg;
+    float bestScore = curMax;
+    if (melodyPrevRow >= 0)
+        for (int row = std::max (0, melodyPrevRow - 2);
+             row <= std::min (kMelodyRows - 1, melodyPrevRow + 2); ++row)
+            if (melodySal[(size_t) row] + kMelodyContinuityBias * curMax > bestScore)
+                { bestScore = melodySal[(size_t) row] + kMelodyContinuityBias * curMax; best = row; }
+
+    // parabolic sub-row refine, then EMA the displayed row
+    float x0 = 0.0f;
+    if (best > 0 && best < kMelodyRows - 1)
+    {
+        const auto& y = melodySal;
+        const float denom = y[(size_t) best - 1] - 2.0f * y[(size_t) best] + y[(size_t) best + 1];
+        if (denom < -1e-9f)
+            x0 = 0.5f * (y[(size_t) best - 1] - y[(size_t) best + 1]) / denom;
+    }
+    const float rawRow = (float) best + juce::jlimit (-1.0f, 1.0f, x0);
+    melodyRowF = melodyPrevRow < 0 ? rawRow
+                                   : melodyRowF + kMelodyRowEma * (rawRow - melodyRowF);
+    melodyPrevRow = best;
+    melOut.row = melodyRowF;
+    melOut.conf = juce::jlimit (0.0f, 1.0f, curMax / melodyMaxEma);
+    melOut.voiced = 1;
 }
 
 // chroma from one FFT frame. Vocal-robustness journey (see docs/research/
@@ -358,6 +444,7 @@ KeyResult KeyDetector::detect() const
         return out;
 
     out.valid = true;
+    lastChroma = avg; // snapshot for the probe's melody-fusion experiments
 
     // two chroma view selection: mean for steady instrument material, max-per-
     // class for vibrato/choir smear (the pitch-crossing frames give sharp class
@@ -381,8 +468,8 @@ KeyResult KeyDetector::detect() const
             for (int i = 0; i < kNumPitchClasses; ++i)
                 profile[(i + rotate) % 12] = (mode == 0 ? kMajorProfile : kMinorProfile)[i];
 
-            const double rMean = correlation (meanView.data(), profile);
-            const double rMax = correlation (maxc.data(), profile);
+            const double rMean = ksCorrelation (meanView.data(), profile);
+            const double rMax = ksCorrelation (maxc.data(), profile);
             const double r = std::max (rMean, rMax);
             if (r > bestR)
             {
@@ -421,8 +508,8 @@ KeyResult KeyDetector::detect() const
                 double profile[kNumPitchClasses];
                 for (int i = 0; i < kNumPitchClasses; ++i)
                     profile[(i + rotate) % 12] = (mode == 0 ? kMajorProfile : kMinorProfile)[i];
-                const double r = std::max (correlation (avg.data(), profile),
-                                           correlation (maxc.data(), profile));
+                const double r = std::max (ksCorrelation (avg.data(), profile),
+                                           ksCorrelation (maxc.data(), profile));
                 if (r > top[0].r)
                     { top[2] = top[1]; top[1] = top[0]; top[0] = { r, rotate, mode }; }
                 else if (r > top[1].r)

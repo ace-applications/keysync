@@ -86,6 +86,10 @@ KeySyncAudioProcessorEditor::KeySyncAudioProcessorEditor (KeySyncAudioProcessor&
     addAndMakeVisible (analyzeButton);
     addAndMakeVisible (proPanel);
 
+#if KEYSYNC_EDITION_PRO == 1
+    addAndMakeVisible (melodyLane);
+#endif
+
     if constexpr (! kIsProEdition)
     {
         getPro.setColour (juce::HyperlinkButton::textColourId, uiColour (kOrange));
@@ -107,7 +111,11 @@ KeySyncAudioProcessorEditor::KeySyncAudioProcessorEditor (KeySyncAudioProcessor&
     };
 
     // shortcut: "Get Pro" URL is a placeholder until ACE Audio ships a real store page
+#if KEYSYNC_EDITION_PRO == 1
+    setSize (380, 780); // melody lane added below the alt-keys panel
+#else
     setSize (380, 620);
+#endif
 }
 
 void KeySyncAudioProcessorEditor::paint (juce::Graphics& g)
@@ -141,6 +149,11 @@ void KeySyncAudioProcessorEditor::resized()
     bound.removeFromTop (18);
     proPanel.setBounds (bound.removeFromTop (236));
     getPro.setBounds (proPanel.getLocalBounds().removeFromBottom (30).reduced (8));
+
+#if KEYSYNC_EDITION_PRO == 1
+    bound.removeFromTop (16);
+    melodyLane.setBounds (bound.removeFromTop (140));
+#endif
 }
 
 // ---------------------------------------------------------------- TitleBar
@@ -174,6 +187,26 @@ void KeySyncAudioProcessorEditor::TitleBar::paint (juce::Graphics& g)
 }
 
 // ---------------------------------------------------------------- KeyDisplay
+
+void KeySyncAudioProcessorEditor::KeyDisplay::drawBpmRow (juce::Graphics& g,
+                                                          juce::Rectangle<float> row,
+                                                          const KeyResult& r) const
+{
+    if (r.bpm > 0.0f && r.bpmConfidence >= 0.5f)
+    {
+        g.setFont (fontOf (owner.interSemi, 15.0f));
+        g.setColour (uiColour (kWhite));
+        g.drawText (juce::String (juce::roundToInt (r.bpm)) + " BPM",
+                    row, juce::Justification::centred);
+    }
+    else
+    {
+        g.setFont (fontOf (owner.inter, 12.0f));
+        g.setColour (uiColour (kGrey));
+        g.drawText ("BPM uncertain - not enough pulse in this audio",
+                    row, juce::Justification::centred);
+    }
+}
 
 void KeySyncAudioProcessorEditor::KeyDisplay::paint (juce::Graphics& g)
 {
@@ -210,20 +243,7 @@ void KeySyncAudioProcessorEditor::KeyDisplay::paint (juce::Graphics& g)
             g.setColour (uiColour (kWhite));
             g.drawText (keyTitle (r), bb, text);
 
-            // BPM: shown when the detector has an honest claim, else "BPM uncertain"
-            if (r.bpm > 0.0f && r.bpmConfidence >= 0.5f)
-            {
-                g.setFont (fontOf (owner.interSemi, 15.0f));
-                g.setColour (uiColour (kWhite));
-                g.drawText (juce::String (juce::roundToInt (r.bpm)) + " BPM",
-                            bpmRow, text);
-            }
-            else
-            {
-                g.setFont (fontOf (owner.inter, 12.0f));
-                g.setColour (uiColour (kGrey));
-                g.drawText ("BPM uncertain - not enough pulse in this audio", bpmRow, text);
-            }
+            drawBpmRow (g, bpmRow.toFloat(), r);
 
             g.setFont (fontOf (owner.inter, 12.0f));
             g.setColour (uiColour (kGrey));
@@ -237,16 +257,23 @@ void KeySyncAudioProcessorEditor::KeyDisplay::paint (juce::Graphics& g)
         case AnalyzeState::lowConfidence:
         {
             const auto r = owner.processor.getLastResult();
+            // same layout contract as the result state, so the BPM row never
+            // vanishes going in or out of the uncertain state
             auto bb = b;
+            auto strip = bb.removeFromBottom (44.0f);
+            auto bpmRow = bb.removeFromBottom (26.0f);
+
             g.setFont (owner.keyFont);
             g.setColour (uiColour (kGrey));
             g.drawText ("Uncertain", bb, text);
+
+            drawBpmRow (g, bpmRow.toFloat(), r);
 
             g.setFont (fontOf (owner.inter, 12.0f));
             g.setColour (uiColour (kOrange));
             g.drawText ("Low confidence - best guess: " + keyTitle (r)
                             + " (" + confidencePercent (r) + ")",
-                        bb.removeFromBottom (44.0f), text);
+                        strip, text);
             break;
         }
         case AnalyzeState::noUsableAudio:
@@ -276,6 +303,22 @@ void KeySyncAudioProcessorEditor::AnalyzeButton::paintButton (juce::Graphics& g,
         shadow.applyTransform (juce::AffineTransform::translation (0.0f, down ? 1.0f : 3.0f));
         g.setColour (uiColour (kOrange).withAlpha (down ? 0.18f : 0.30f));
         g.fillPath (shadow);
+    }
+
+    // core bloom: a warm light pooled at the crown, inside the button shape;
+    // hovers brighter — the "live" signal without moving anything
+    if (! busy)
+    {
+        g.saveState();
+        g.reduceClipRegion (p);
+        const float bloomA = down ? 0.34f : over ? 0.30f : 0.16f;
+        juce::ColourGradient bloom (uiColour (kOrange).withAlpha (bloomA),
+                                    b.getCentreX(), b.getY() + b.getHeight() * 0.10f,
+                                    juce::Colour (0x00FF8A24u),
+                                    b.getCentreX(), b.getBottom() + b.getHeight() * 0.25f, false);
+        g.setGradientFill (bloom);
+        g.fillRect (b);
+        g.restoreState();
     }
 
     // vertical sheen: brighter crown into flat brand orange; fades when busy
@@ -329,16 +372,22 @@ void KeySyncAudioProcessorEditor::ProPanel::paint (juce::Graphics& g)
 
     if (kIsProEdition)
     {
-        if (owner.processor.getState() != AnalyzeState::result || ! r.valid)
+        // rows show whenever there is anything to read — including the
+        // low-confidence best guess; the placeholder is only for "no result yet"
+        const bool ready = r.valid
+            && (owner.processor.getState() == AnalyzeState::result
+                || owner.processor.getState() == AnalyzeState::lowConfidence);
+        if (! ready)
         {
             g.setFont (fontOf (owner.inter, 13.0f));
             g.setColour (uiColour (kGrey));
             g.drawText ("Analyze to see compatible keys", rows, juce::Justification::centred);
         }
-
-        const int rowsH = (int) rows.getHeight() / 4; // rows fill the panel, no dead space
-        for (size_t i = 0; i < suggestions.size() && i < 4; ++i)
+        else
         {
+            const int rowsH = (int) rows.getHeight() / 4; // rows fill the panel, no dead space
+            for (size_t i = 0; i < suggestions.size() && i < 4; ++i)
+            {
             auto row = rows.removeFromTop ((float) rowsH);
 
             // relationship chip, right aligned
@@ -358,6 +407,7 @@ void KeySyncAudioProcessorEditor::ProPanel::paint (juce::Graphics& g)
             g.drawText (juce::String (pitchClassName (suggestions[i].tonicPc)) + " "
                             + modeName (suggestions[i].mode),
                         row, juce::Justification::centredLeft);
+        }
         }
     }
     else if (! kIsProEdition)
@@ -395,6 +445,93 @@ void KeySyncAudioProcessorEditor::ProPanel::hoverRow()
         "Parallel: same root, major/minor swapped",
     };
     setTooltip (row >= 0 && row < 4 ? juce::String (gloss[row]) : juce::String());
+}
+
+// Pro-only rolling melody contour: oldest on the left, latest hop at the
+// right edge (1 px per full-rate hop ≈ 46.4 ms → ~16 s visible). Painted from
+// the detector's seqlocked melody ring, one Path per hop-batch — no Timer
+// repaint storm, no flicker. Conf → alpha, unvoiced frames = line breaks.
+void KeySyncAudioProcessorEditor::MelodyLane::paint (juce::Graphics& g)
+{
+    auto bb = getLocalBounds();
+    const auto b = bb.toFloat();
+    drawGlass (g, b);
+
+    // header label
+    g.setFont (fontOf (owner.interSemi, 12.0f));
+    g.setColour (uiColour (kGrey));
+    g.drawText ("MELODY", bb.removeFromTop (24).reduced (14, 0).toFloat(),
+                juce::Justification::centredLeft);
+
+    const KeyDetector& det = owner.processor.detectorView();
+    const int cap = det.melodyRingSize();
+    const float rowH = (float) getHeight() / (float) KeyDetector::kMelodyRows;
+
+    // octave guide lines + labels at every C row
+    for (int octave = 0; octave < 4; ++octave)
+    {
+        const float y = (float) (KeyDetector::kMelodyRows - 1 - octave * 12) * rowH;
+        auto track = juce::Rectangle<float> (b.getX(), b.getY() + y, b.getWidth(), 1.0f);
+        g.setColour (uiColour (kGrey).withAlpha (0.12f));
+        g.fillRect (track);
+        g.setFont (fontOf (owner.inter, 9.0f));
+        g.setColour (uiColour (kGrey).withAlpha (0.45f));
+        g.drawText (juce::String (("C2C3C4C5") + octave * 2, 2), 8.0f,
+                    b.getY() + y - 7.0f, 40.0f, 14.0f, juce::Justification::centredLeft);
+    }
+
+    const int write = det.melodyWriteIndex();
+    float yPrev = 0.0f;
+    bool lineOpen = false;
+    float confSum = 0.0f;
+    int confCount = 0;
+
+    juce::Path line, glow;
+    const float x0 = b.getX(), y0 = b.getY(), h = b.getHeight() - 24.0f;
+
+    for (int col = 0; col < (int) b.getWidth(); ++col)
+    {
+        const int idx = ((write - 1 - col) % cap + cap) % cap;
+        MelodySample s;
+        if (! det.tryReadMelody (det.melodyRingData()[idx], s) || s.voiced == 0)
+        {
+            lineOpen = false;
+            continue;
+        }
+        const float x = x0 + (float) (b.getWidth() - 1 - col);
+        const float y = y0 + 24.0f + (float) (KeyDetector::kMelodyRows / 2 - s.row)
+                          * rowH;
+        if (lineOpen)
+        {
+            confSum += s.conf;
+            ++confCount;
+            line.lineTo (x, y);
+        }
+        else
+        {
+            line.startNewSubPath (x, y);
+            confSum = s.conf;
+            confCount = 1;
+            lineOpen = true;
+        }
+        yPrev = y;
+    }
+    (void) yPrev; (void) h;
+
+    if (confCount > 0)
+    {
+        const float conf = confSum / (float) confCount;
+        glow.setUsingNonZeroWinding (false);
+        glow.addPath (line);
+        g.setColour (uiColour (kOrange).withAlpha (0.20f + 0.30f * conf));
+        g.strokePath (glow, juce::PathStrokeType (6.0f + 3.0f * conf,
+                                                  juce::PathStrokeType::curved,
+                                                  juce::PathStrokeType::rounded));
+
+        g.setColour (uiColour (kOrange).withAlpha (0.55f + 0.45f * conf));
+        g.strokePath (line, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved,
+                                                  juce::PathStrokeType::rounded));
+    }
 }
 
 } // namespace keysync

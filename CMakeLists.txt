@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(ACEAudioKeySync VERSION 0.2.0 LANGUAGES C CXX)
+project(ACEAudioKeySync VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -85,3 +85,15 @@ target_compile_definitions(keysync_probe PRIVATE
     JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 KEY_SYNC_DEBUG_TEMPO=1 KEY_SYNC_DEBUG_KEY=1)
 target_link_libraries(keysync_probe PRIVATE
     juce::juce_audio_basics juce::juce_dsp juce::juce_audio_formats)
+
+# dev-only CLI: melody-extraction prototype harness (probe-first gate for the
+# melody feature — no plugin code until this passes on music/)
+add_executable(keysync_melody
+    source/MelodyProbe.cpp
+    source/dsp/KeyDetector.cpp
+    source/dsp/Recommender.cpp)
+target_compile_definitions(keysync_melody PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+target_link_libraries(keysync_melody PRIVATE
+    juce::juce_audio_basics juce::juce_dsp juce::juce_audio_formats)
+target_include_directories(keysync_melody PRIVATE source)
+

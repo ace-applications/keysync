@@ -52,6 +52,9 @@ public:
     AnalyzeState getState() const { return state.load (std::memory_order_relaxed); }
     KeyResult getLastResult() const { return lastResult; }
 
+    // melody lane (Pro): read access to the detector's tracker ring
+    const KeyDetector& detectorView() const { return detector; }
+
     // true when audio above the silence threshold ran through the plugin since
     // the displayed result was computed — the shown key may no longer match
     bool isStale() const { return stale.load (std::memory_order_relaxed); }

@@ -43,6 +43,10 @@ private:
         KeySyncAudioProcessorEditor& owner;
         explicit KeyDisplay (KeySyncAudioProcessorEditor& o) : owner (o) {}
         void paint (juce::Graphics&) override;
+        // honest BPM claim, else a short grey excuse — never a blank row; shared
+        // by the result and low-confidence states so the layout contract holds
+        void drawBpmRow (juce::Graphics& g, juce::Rectangle<float> row,
+                         const KeyResult& r) const;
     };
 struct AnalyzeButton : juce::Button
     {
@@ -53,9 +57,24 @@ struct AnalyzeButton : juce::Button
         void mouseEnter (const juce::MouseEvent&) override { repaint(); };
         void mouseExit (const juce::MouseEvent&) override { repaint(); };
     };
-    struct ProPanel : juce::Component, juce::SettableTooltipClient
+    // Pro-only rolling melody contour lane (docs/research/melody-analysis.md):
+    // reads the detector's melody ring, newest hop at the right edge; 1 px per
+    // hop ≈ the last 16 s of the predominant line, orange = tracker confidence
+    struct MelodyLane : juce::Component, juce::Timer
     {
         KeySyncAudioProcessorEditor& owner;
+        explicit MelodyLane (KeySyncAudioProcessorEditor& o) : owner (o) { startTimer (45); }
+        ~MelodyLane() override { stopTimer(); }
+        void paint (juce::Graphics&) override;
+        void timerCallback() override
+        {
+            const int w = owner.processor.detectorView().melodyWriteIndex();
+            if (w != lastSeenWrite) { lastSeenWrite = w; repaint(); }
+        }
+        int lastSeenWrite = -1;
+    };
+    struct ProPanel : juce::Component, juce::SettableTooltipClient
+    {        KeySyncAudioProcessorEditor& owner;
         explicit ProPanel (KeySyncAudioProcessorEditor& o) : owner (o) {}
         void paint (juce::Graphics&) override;
         void mouseMove (const juce::MouseEvent&) override { hoverRow(); }
@@ -68,6 +87,7 @@ struct AnalyzeButton : juce::Button
     KeyDisplay keyDisplay { *this };
     AnalyzeButton analyzeButton { *this };
     ProPanel proPanel { *this };
+    MelodyLane melodyLane { *this };
     juce::TooltipWindow tooltip; // explains chip vocabulary on hover
     juce::HyperlinkButton getPro { "Get ACE Audio KeySync Pro", juce::URL ("https://aceaudio.example") };
 

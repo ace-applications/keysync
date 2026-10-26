@@ -19,6 +19,38 @@ inline const char* modeName (int mode) { return mode == 0 ? "major" : "minor"; }
 
 const char* pitchClassName (int pc);
 
+// Krumhansl-Schmuckler key profiles (shared by the detector and the dev probe
+// for melody-fusion experiments).
+inline constexpr double kMajorProfile[kNumPitchClasses] =
+    { 6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88 };
+inline constexpr double kMinorProfile[kNumPitchClasses] =
+    { 6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17 };
+
+// Pearson correlation of two 12-bin vectors (0 when either is degenerate).
+inline double ksCorrelation (const double* a, const double* b)
+{
+    double meanA = 0.0, meanB = 0.0;
+    for (int i = 0; i < kNumPitchClasses; ++i)
+    {
+        meanA += a[i];
+        meanB += b[i];
+    }
+    meanA /= (double) kNumPitchClasses;
+    meanB /= (double) kNumPitchClasses;
+
+    double num = 0.0, denA = 0.0, denB = 0.0;
+    for (int i = 0; i < kNumPitchClasses; ++i)
+    {
+        const double da = a[i] - meanA;
+        const double db = b[i] - meanB;
+        num += da * db;
+        denA += da * da;
+        denB += db * db;
+    }
+    const double den = std::sqrt (denA) * std::sqrt (denB);
+    return den > 0.0 ? num / den : 0.0;
+}
+
 // tonicPc: 0=C ... 11=B. mode: 0 = major, 1 = minor.
 struct KeyResult
 {
@@ -35,6 +67,24 @@ struct KeyResult
 };
 
 juce::String keyTitle (const KeyResult& r); // "A minor"
+
+// Melody tracker output, one slot per full-rate hop (uniform time grid like the
+// tempo ring; silent frames publish voiced==0).
+struct MelodySlot
+{
+    std::atomic<uint32_t> seq { 0 };
+    float row = 0.0f;    // fractional row 0..47 = C2..B5 (MIDI 36 + row)
+    float conf = 0.0f;   // 0..1 salience-normalised strength
+    uint8_t voiced = 0;
+};
+
+// Value copy of one released MelodySlot (frame-local, non-atomic).
+struct MelodySample
+{
+    float row = 0.0f;
+    float conf = 0.0f;
+    uint8_t voiced = 0;
+};
 
 // Rolling chromagram + Krumhansl-Schmuckler key detection.
 //
@@ -65,6 +115,19 @@ public:
     // key gating uses decimated frames (185.8 ms apart at 44.1/4), so the
     // 24-frame full-rate minimum (~1.2 s) maps to ~12 chroma frames.
     static constexpr int kMinKeyFrames = kMinActiveFrames / 2;
+
+    // ---- melody tracker (v1.1, display-only, Pro lane) — docs/research/
+    // melody-analysis.md: HMM-lite salience grid; fusion into the key stage is
+    // PARKED (probe-verified: cheap tracker can't steer KS on dense mixes).
+    static constexpr int kMelodyRows = 48;      // C2..B5, MIDI 36..83
+    static constexpr int kMidiMelLow = 36;
+    static constexpr int kMelodyHarmonics = 6;
+    static constexpr float kMelodyHarmonicDecay = 0.8f;
+    static constexpr float kMelodyPeakFloorRatio = 0.20f; // of frame peak
+    static constexpr float kMelodyVoicingRatio = 0.12f;   // of running max salience
+    static constexpr float kMelodyMaxEma = 0.005f;        // EMA toward frame max (~9 s)
+    static constexpr float kMelodyRowEma = 0.50f;
+    static constexpr float kMelodyContinuityBias = 0.25f; // +-2 semitone stay bonus
 
     void prepare (double sampleRate);
     void reset();
@@ -103,6 +166,7 @@ private:
                           std::array<float, kTempoBands>& bands);
     bool tryReadChromaFrame (const ChromaSlotTight& slot,
                              std::array<float, kNumPitchClasses>& out) const;
+    void processMelodyFrame (const std::vector<double>& mags, MelodySample& out);
     void estimateTempo (const std::vector<std::array<float, kTempoBands>>& bandFrames,
                         KeyResult& out) const;
 
@@ -110,6 +174,13 @@ private:
 
     double sampleRate = 0.0;
     double chromaSampleRate = 0.0;        // decimated rate for the chroma branch
+
+    // mean chroma view from the last detect() call (filled only when valid);
+    // probe seam for melody-fusion experiments
+    mutable std::array<double, kNumPitchClasses> lastChroma {};
+public:
+    std::array<double, kNumPitchClasses> chromaView() const { return lastChroma; }
+private:
 
     std::vector<float> window;            // Hann, kFftSize
     std::vector<float> pending;           // sample FIFO (full rate, tempo path)
@@ -133,6 +204,34 @@ private:
     std::unique_ptr<ChromaSlotTight[]> chromaRing; // chroma path ring (12-bin)
     int chromaRingCapacity = 0;
     int chromaRingWrite = 0;
+
+    // melody tracker state (same hop cadence as the tempo ring)
+    std::unique_ptr<MelodySlot[]> melodyRing;
+    int melodyRingWrite = 0;                  // shares ringCapacity with frameRing
+    std::vector<double> melodyPeakMag;        // peak-masked magnitudes (audio thread)
+    std::array<float, kMelodyRows> melodySal {};
+    std::array<int, kMelodyHarmonics * kMelodyRows> melodyRowBin {}; // [h][row]
+    float melodyMaxEma = 0.0f;
+    int melodyPrevRow = -1;
+    float melodyRowF = 0.0f;
+
+public:
+    // melody lane polling (message thread): read a seqlocked tracker sample.
+    // out.row is the fractional row 0..47 (C2..B5); voiced==0 means silence.
+    bool tryReadMelody (const MelodySlot& slot, MelodySample& out) const
+    {
+        const uint32_t s1 = slot.seq.load (std::memory_order_acquire);
+        if (s1 == 0 || (s1 & 1u) != 0)
+            return false;
+        out.row = slot.row;
+        out.conf = slot.conf;
+        out.voiced = slot.voiced;
+        std::atomic_thread_fence (std::memory_order_acquire);
+        return slot.seq.load (std::memory_order_relaxed) == s1;
+    }
+    int melodyWriteIndex() const { return melodyRingWrite; }
+    const MelodySlot* melodyRingData() const { return melodyRing.get(); }
+    int melodyRingSize() const { return ringCapacity; }
 
     juce::dsp::FFT fft { kFftOrder };
 };
