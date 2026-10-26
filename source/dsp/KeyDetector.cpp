@@ -56,6 +56,7 @@ juce::String keyTitle (const KeyResult& r)
 void KeyDetector::prepare (double newSampleRate)
 {
     sampleRate = newSampleRate;
+    chromaSampleRate = newSampleRate / (double) kChromaDecim;
 
     window.resize ((size_t) kFftSize);
     for (int i = 0; i < kFftSize; ++i)
@@ -66,18 +67,40 @@ void KeyDetector::prepare (double newSampleRate)
     frameData.assign ((size_t) kFftSize * 2, 0.0f);
     frameMags.assign ((size_t) kFftSize / 2 + 1, 0.0);
 
+    // mirror the same capacity policy on the decimated FIFO
+    chromaPending.assign ((size_t) ((kFftSize + kMaxBlockSamples) / kChromaDecim) + 8, 0.0f);
+    chromaPendingSize = 0;
+    chromaFrameData.assign ((size_t) kFftSize * 2, 0.0f);
+    decimD1[0] = decimD1[1] = decimD1[2] = 0.0f;
+    decimP2[0] = decimP2[1] = decimP2[2] = 0.0f;
+    decimPhase = 0;
+
     const int windowFrames = (int) std::ceil ((kAnalysisWindowSeconds * sampleRate) / (double) kHopSize) + 4;
     ringCapacity = windowFrames;
     frameRing.reset (new ChromaSlot[(size_t) windowFrames]); // default-constructed, no copies
     ringWrite = 0;
+
+    // chroma ring holds the same wall-clock span on the decimated grid
+    const int chromaWindowFrames =
+        (int) std::ceil ((kAnalysisWindowSeconds * chromaSampleRate) / (double) kHopSize) + 4;
+    chromaRingCapacity = chromaWindowFrames;
+    chromaRing.reset (new ChromaSlotTight[(size_t) chromaWindowFrames]);
+    chromaRingWrite = 0;
 }
 
 void KeyDetector::reset()
 {
     pendingSize = 0;
     ringWrite = 0;
+    chromaPendingSize = 0;
+    chromaRingWrite = 0;
+    decimD1[0] = decimD1[1] = decimD1[2] = 0.0f;
+    decimP2[0] = decimP2[1] = decimP2[2] = 0.0f;
+    decimPhase = 0;
     for (int i = 0; i < ringCapacity; ++i)
         frameRing[(size_t) i].seq.store (0, std::memory_order_release);
+    for (int i = 0; i < chromaRingCapacity; ++i)
+        chromaRing[(size_t) i].seq.store (0, std::memory_order_release);
 }
 
 void KeyDetector::addMono (const float* samples, int numSamples)
@@ -93,6 +116,32 @@ void KeyDetector::addMono (const float* samples, int numSamples)
     std::memcpy (pending.data() + pendingSize, samples, sizeof (float) * (size_t) copy);
     pendingSize += copy;
 
+    // stream the same samples through the decimation filter into the chroma
+    // FIFO: two cascaded 4-sample boxcars (attenuates the 5.5-22 kHz band
+    // ~26 dB where it would otherwise alias back under the new Nyquist)
+    const int chromaCapacity = (int) chromaPending.size();
+    for (int i = 0; i < copy; ++i)
+    {
+        const float x = samples[i];
+        const float y1 = (x + decimD1[0] + decimD1[1] + decimD1[2]) * 0.25f; // @sr
+        decimD1[2] = decimD1[1];
+        decimD1[1] = decimD1[0];
+        decimD1[0] = x;
+
+        if (++decimPhase < kChromaDecim)
+            continue;
+        decimPhase = 0;
+
+        const float z = (y1 + decimP2[0] + decimP2[1] + decimP2[2]) * 0.25f; // @sr/4
+        decimP2[2] = decimP2[1];
+        decimP2[1] = decimP2[0];
+        decimP2[0] = y1;
+
+        if (chromaPendingSize < chromaCapacity)
+            chromaPending[(size_t) chromaPendingSize++] = z;
+        // else: over a 3 s block arrived at once — truncated like pending[]
+    }
+
     processPendingFrames();
 }
 
@@ -106,9 +155,8 @@ void KeyDetector::processPendingFrames()
             sqrSum += (double) pending[(size_t) i] * (double) pending[(size_t) i];
         const double rms = std::sqrt (sqrSum / (double) kFftSize);
 
-        // every hop enters the ring on a uniform time grid (the tempo stage needs
-        // adjacent-evenly-spaced frames); silent frames publish an empty payload
-        std::array<float, kNumPitchClasses> chroma {};
+        // tempo-ring frames publish on a uniform time grid; the chroma word
+        // is unused (the chroma branch has its own ring at sampleRate/4)
         std::array<float, kTempoBands> bands {};
         if (rms >= kRmsThreshold)
         {
@@ -119,14 +167,17 @@ void KeyDetector::processPendingFrames()
 
             fft.performRealOnlyForwardTransform (frameData.data(), true);
 
-            chromaFromFrame (frameData.data(), kFftSize, sampleRate, chroma, bands);
+            std::array<float, kNumPitchClasses> chromaTmp {};
+            std::array<float, kTempoBands> bandsTmp {};
+            chromaFromFrame (frameData.data(), kFftSize, sampleRate, chromaTmp, bandsTmp);
+            bands = bandsTmp;
         }
 
         // seqlock publish: book a slot, mark in-progress, fill, mark stable
         auto& slot = frameRing[(size_t) ringWrite];
         ringWrite = (ringWrite + 1) % ringCapacity; // next frame overwrites oldest
         slot.seq.fetch_add (1, std::memory_order_release);    // odd: mid-write
-        slot.chroma = chroma;
+        slot.chroma = {};
         slot.bands = bands;
         slot.seq.fetch_add (1, std::memory_order_release);    // even: stable
 
@@ -135,6 +186,46 @@ void KeyDetector::processPendingFrames()
         std::memmove (pending.data(), pending.data() + kHopSize, sizeof (float) * (size_t) remaining);
         pendingSize = remaining;
     }
+
+    processChromaPendingFrames();
+}
+
+void KeyDetector::processChromaPendingFrames()
+{
+    while (chromaPendingSize >= kFftSize)
+    {
+        std::array<float, kNumPitchClasses> chroma {};
+        // residual RMS check identical to the full-rate branch so silence
+        // stays silent on both rings
+        double sqrSum = 0.0;
+        for (int i = 0; i < kFftSize; ++i)
+            sqrSum += (double) chromaPending[(size_t) i] * (double) chromaPending[(size_t) i];
+        const double rms = std::sqrt (sqrSum / (double) kFftSize);
+
+        if (rms >= kRmsThreshold)
+        {
+            for (int i = 0; i < kFftSize; ++i)
+                chromaFrameData[(size_t) i] = chromaPending[(size_t) i] * window[(size_t) i];
+            for (int i = kFftSize; i < kFftSize * 2; ++i)
+                chromaFrameData[(size_t) i] = 0.0f;
+
+            fft.performRealOnlyForwardTransform (chromaFrameData.data(), true);
+            std::array<float, kTempoBands> bandsTmp {};
+            chromaFromFrame (chromaFrameData.data(), kFftSize, chromaSampleRate,
+                             chroma, bandsTmp);
+        }
+
+        auto& slot = chromaRing[(size_t) chromaRingWrite];
+        chromaRingWrite = (chromaRingWrite + 1) % chromaRingCapacity;
+        slot.seq.fetch_add (1, std::memory_order_release);    // odd: mid-write
+        slot.chroma = chroma;
+        slot.seq.fetch_add (1, std::memory_order_release);    // even: stable
+
+        const int remaining = chromaPendingSize - kHopSize;
+        std::memmove (chromaPending.data(), chromaPending.data() + kHopSize,
+                      sizeof (float) * (size_t) remaining);
+        chromaPendingSize = remaining;
+    }
 }
 
 // chroma from one FFT frame. Vocal-robustness journey (see docs/research/
@@ -142,7 +233,7 @@ void KeyDetector::processPendingFrames()
 // tuning estimation, fractional bin splitting and HPCP magnitude compression
 // all REGRESSED real music and were removed; the survivor is the max-per-class
 // chroma view consumed by detect() alongside the mean view.
-void KeyDetector::chromaFromFrame (const float* fftData, int fftSize, double sr,
+void KeyDetector::chromaFromFrame (const float* fftData, int fftSize, double freqSr,
                                    std::array<float, kNumPitchClasses>& chroma,
                                    std::array<float, kTempoBands>& bands)
 {
@@ -158,15 +249,17 @@ void KeyDetector::chromaFromFrame (const float* fftData, int fftSize, double sr,
         const double im = fftData[2 * bin + 1];
         mags[bin] = std::sqrt (re * re + im * im);
     }
+
     double sum = 0.0;
     for (int bin = 0; bin < halfBins; ++bin)
     {
         double mag = mags[bin];
         if (mag <= 0.0)
             continue;
-        const double freq = (double) bin * sr / (double) fftSize;
+        const double freq = (double) bin * freqSr / (double) fftSize;
 
-        // tempo bands consume raw magnitudes
+        // tempo bands consume raw magnitudes (only meaningful on the full-rate
+        // call; the chroma branch passes a throwaway bands array)
         if (freq >= 35.0 && freq <= 8000.0)
         {
             const int band = juce::jlimit (0, kTempoBands - 1,
@@ -213,12 +306,23 @@ static bool frameHasContent (const std::array<float, kNumPitchClasses>& chroma)
 
 int KeyDetector::stableFrameCount() const
 {
-    ChromaSlot tmp;
+    std::array<float, kNumPitchClasses> tmp;
     int count = 0;
-    for (int i = 0; i < ringCapacity; ++i)
-        if (tryReadFrame (frameRing[(size_t) i], tmp) && frameHasContent (tmp.chroma))
+    for (int i = 0; i < chromaRingCapacity; ++i)
+        if (tryReadChromaFrame (chromaRing[(size_t) i], tmp) && frameHasContent (tmp))
             ++count;
     return count;
+}
+
+bool KeyDetector::tryReadChromaFrame (const ChromaSlotTight& slot,
+                                      std::array<float, kNumPitchClasses>& out) const
+{
+    const uint32_t s1 = slot.seq.load (std::memory_order_acquire);
+    if (s1 == 0 || (s1 & 1u) != 0)
+        return false;
+    out = slot.chroma;
+    std::atomic_thread_fence (std::memory_order_acquire);
+    return slot.seq.load (std::memory_order_relaxed) == s1;
 }
 
 KeyResult KeyDetector::detect() const
@@ -228,29 +332,20 @@ KeyResult KeyDetector::detect() const
     std::array<double, kNumPitchClasses> avg {};
     std::array<double, kNumPitchClasses> maxc {}; // max per class across frames
     int count = 0;
-    ChromaSlot tmp;
-    std::vector<std::array<float, kNumPitchClasses>> chromaFrames;
-    std::vector<std::array<float, kTempoBands>> bandFrames;
-    chromaFrames.reserve ((size_t) ringCapacity);
-    bandFrames.reserve ((size_t) ringCapacity);
-    for (int i = 0; i < ringCapacity; ++i)
-        if (tryReadFrame (frameRing[(size_t) i], tmp))
+    std::array<float, kNumPitchClasses> ctmp;
+    for (int i = 0; i < chromaRingCapacity; ++i)
+        if (tryReadChromaFrame (chromaRing[(size_t) i], ctmp) && frameHasContent (ctmp))
         {
-            if (frameHasContent (tmp.chroma))
+            for (int pc = 0; pc < kNumPitchClasses; ++pc)
             {
-                for (int pc = 0; pc < kNumPitchClasses; ++pc)
-                {
-                    avg[(size_t) pc] += tmp.chroma[(size_t) pc];
-                    maxc[(size_t) pc] = std::max (maxc[(size_t) pc],
-                                                  (double) tmp.chroma[(size_t) pc]);
-                }
-                ++count;
+                avg[(size_t) pc] += ctmp[(size_t) pc];
+                maxc[(size_t) pc] = std::max (maxc[(size_t) pc],
+                                              (double) ctmp[(size_t) pc]);
             }
-            chromaFrames.push_back (tmp.chroma); // full time grid for the tempo stage
-            bandFrames.push_back (tmp.bands);
+            ++count;
         }
 
-    if (count < kMinActiveFrames)
+    if (count < kMinKeyFrames)
         return out;
 
     double energy = 0.0;
@@ -342,8 +437,18 @@ KeyResult KeyDetector::detect() const
     }
 #endif
 
-    // tempo stage — independent of the key fields above; stays 0/0 when unsure
-    estimateTempo (bandFrames, out);
+    // tempo stage — independent of the key fields above; stays 0/0 when unsure.
+    // Reads the full-rate tempo ring for the bands grid (chroma rings live on
+    // the decimated grid and would upset the ODF frame rate).
+    {
+        ChromaSlot ttmp;
+        std::vector<std::array<float, kTempoBands>> bandFrames;
+        bandFrames.reserve ((size_t) ringCapacity);
+        for (int i = 0; i < ringCapacity; ++i)
+            if (tryReadFrame (frameRing[(size_t) i], ttmp))
+                bandFrames.push_back (ttmp.bands);
+        estimateTempo (bandFrames, out);
+    }
     return out;
 }
 
